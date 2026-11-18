@@ -13,8 +13,9 @@ mod workspace;
 mod files_view_test {
     use std::{cell::Cell, fs};
 
-    use crate::files_view::{Request, accept_opened};
+    use crate::files_view::{Request, accept_opened, write_warning};
     use crate::windows_open_with::OpenWithOutcome;
+    use terminal_client::FileError;
 
     #[test]
     fn files_discards_stale_results() {
@@ -24,6 +25,16 @@ mod files_view_test {
         first.invalidate();
         assert!(!prepared.is_current());
         assert!(replacement.is_current());
+    }
+
+    #[test]
+    fn files_disconnected_write_still_has_a_warning() {
+        let request = Request::default();
+        request.invalidate();
+        assert!(!request.is_current());
+        let warning = write_warning(&FileError::Remote(ssh::SftpError::OutcomeUnknown));
+        assert!(warning.is_some_and(|message| message.contains("Check the remote file")));
+        assert!(write_warning(&FileError::AttemptEnded).is_none());
     }
 
     #[test]

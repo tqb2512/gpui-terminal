@@ -3,7 +3,10 @@ use std::time::Duration;
 use tokio::{io::AsyncWriteExt, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{FileError, file_transfer::LocalDownload};
+use crate::{
+    FileError,
+    file_transfer::{LocalDownload, open_regular},
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -37,5 +40,19 @@ async fn transfer_cancellation_keeps_original_and_ends_promptly() -> TestResult 
     ));
     assert!(!destination.exists());
     assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_rejects_local_shortcut_files() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    for name in ["other.LNK", "website.url"] {
+        let path = directory.path().join(name);
+        std::fs::write(&path, b"shortcut")?;
+        assert!(matches!(
+            open_regular(&path).await,
+            Err(FileError::NotRegular)
+        ));
+    }
     Ok(())
 }

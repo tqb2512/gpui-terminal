@@ -148,6 +148,10 @@ impl server::Handler for Server {
                         listed: 0,
                     },
                 ));
+                self.files
+                    .lock()
+                    .map_err(|_| russh::Error::Disconnect)?
+                    .channel = Some((session.handle(), channel_id));
                 return Ok(());
             }
         }
@@ -238,6 +242,8 @@ struct FixtureFiles {
     stall_rename: bool,
     rename_calls: usize,
     extended_renames: usize,
+    no_hardlink: bool,
+    channel: Option<(server::Handle, ChannelId)>,
 }
 
 struct Files {
@@ -283,6 +289,16 @@ impl russh_sftp::server::Handler for Files {
         response
             .extensions
             .insert("posix-rename@openssh.com".into(), "1".into());
+        if !self
+            .state
+            .lock()
+            .map_err(|_| StatusCode::Failure)?
+            .no_hardlink
+        {
+            response
+                .extensions
+                .insert("hardlink@openssh.com".into(), "1".into());
+        }
         Ok(response)
     }
 
@@ -433,9 +449,6 @@ impl russh_sftp::server::Handler for Files {
         let stall = {
             let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
             state.rename_calls += 1;
-            if state.contents.contains_key(&newpath) {
-                return Err(StatusCode::Failure);
-            }
             let file = state
                 .contents
                 .remove(&oldpath)
@@ -458,7 +471,10 @@ impl russh_sftp::server::Handler for Files {
         request: String,
         data: Vec<u8>,
     ) -> Result<Packet, Self::Error> {
-        if request != "posix-rename@openssh.com" {
+        if !matches!(
+            request.as_str(),
+            "posix-rename@openssh.com" | "hardlink@openssh.com"
+        ) {
             return Err(StatusCode::OpUnsupported);
         }
         fn read_path<'a>(bytes: &mut &'a [u8]) -> Option<&'a str> {
@@ -471,12 +487,38 @@ impl russh_sftp::server::Handler for Files {
         let old = read_path(&mut bytes).ok_or(StatusCode::BadMessage)?;
         let new = read_path(&mut bytes).ok_or(StatusCode::BadMessage)?;
         assert!(bytes.is_empty());
-        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
-        let contents = state.contents.remove(old).ok_or(StatusCode::NoSuchFile)?;
-        let mode = state.modes.remove(old).ok_or(StatusCode::NoSuchFile)?;
-        state.contents.insert(new.to_owned(), contents);
-        state.modes.insert(new.to_owned(), mode);
-        state.extended_renames += 1;
+        let stall = {
+            let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+            let (contents, mode) = if request == "hardlink@openssh.com" {
+                if state.no_hardlink {
+                    return Err(StatusCode::OpUnsupported);
+                }
+                state.extended_renames += 1;
+                if state.contents.contains_key(new) {
+                    return Err(StatusCode::Failure);
+                }
+                (
+                    state
+                        .contents
+                        .get(old)
+                        .ok_or(StatusCode::NoSuchFile)?
+                        .clone(),
+                    *state.modes.get(old).ok_or(StatusCode::NoSuchFile)?,
+                )
+            } else {
+                state.extended_renames += 1;
+                (
+                    state.contents.remove(old).ok_or(StatusCode::NoSuchFile)?,
+                    state.modes.remove(old).ok_or(StatusCode::NoSuchFile)?,
+                )
+            };
+            state.contents.insert(new.to_owned(), contents);
+            state.modes.insert(new.to_owned(), mode);
+            state.stall_rename
+        };
+        if stall {
+            return std::future::pending().await;
+        }
         Ok(ok_status(id).into())
     }
 }
@@ -668,6 +710,28 @@ async fn sftp_opens_once_without_reauthentication() -> TestResult {
 }
 
 #[tokio::test]
+async fn sftp_refresh_reopens_channel_closed_by_server() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (mut session, first) = connected_files(&server).await?;
+    let (handle, channel) = server
+        .file_state()?
+        .channel
+        .clone()
+        .ok_or(io::Error::other("missing SFTP channel"))?;
+    handle
+        .close(channel)
+        .await
+        .map_err(|()| io::Error::other("could not close fixture channel"))?;
+    assert!(timeout(DEADLINE, first.home()).await?.is_err());
+    let second = timeout(DEADLINE, session.sftp_opener().open()).await??;
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.home().await?.as_str(), "/home/test");
+    session.try_send(Input::Bytes(b"still live".to_vec()))?;
+    assert_eq!(output(&mut session, 10).await?, b"still live");
+    Ok(())
+}
+
+#[tokio::test]
 async fn sftp_refusal_preserves_shell() -> TestResult {
     let (server, _) = fixture().await?;
     let mut session = server.connect(AuthMethod::Password);
@@ -797,11 +861,29 @@ async fn sftp_publish_timeout_is_unknown() -> TestResult {
         ));
     }
     let state = server.file_state()?;
-    assert_eq!(state.rename_calls, 1);
+    assert_eq!(state.extended_renames, 1);
+    assert_eq!(state.rename_calls, 0);
     assert_eq!(
         state.contents.get(path.as_str()).map(Vec::as_slice),
         Some(b"new".as_slice())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_create_only_never_uses_standard_rename_without_hardlink() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    server.file_state()?.no_hardlink = true;
+    let (_session, files) = connected_files(&server).await?;
+    let path = files.home().await?.child("report.txt")?;
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(b"new").await?;
+    stage.seal(None).await?;
+    assert!(stage.publish(PublishMode::CreateOnly).await.is_err());
+    stage.abort().await?;
+    let state = server.file_state()?;
+    assert!(state.contents.is_empty());
+    assert_eq!(state.rename_calls, 0);
     Ok(())
 }
 

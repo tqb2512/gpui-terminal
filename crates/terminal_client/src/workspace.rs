@@ -28,10 +28,13 @@ pub(crate) struct Workspace {
     terminal: Entity<TerminalView>,
     confirm: Option<Confirm>,
     message: Option<String>,
+    file_warning: Option<String>,
+    file_warnings: tokio::sync::mpsc::Sender<String>,
     hosts_visible: bool,
     pending: HashMap<u64, Task<()>>,
     serial: u64,
     _startup: Task<()>,
+    _file_warnings: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -95,6 +98,20 @@ impl Workspace {
     pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| Field::new("Search saved hosts", "", false, cx));
         let terminal = cx.new(TerminalView::new);
+        let (file_warnings, mut warnings) = tokio::sync::mpsc::channel(16);
+        let warning_task = cx.spawn(async move |weak, cx| {
+            while let Some(warning) = warnings.recv().await {
+                if weak
+                    .update(cx, |view, cx| {
+                        view.file_warning = Some(warning);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let subscriptions = vec![
             cx.subscribe(&search, |_, _, _: &FieldEdit, cx| cx.notify()),
             cx.subscribe(&terminal, |view, _, event: &ViewEvent, cx| {
@@ -149,10 +166,13 @@ impl Workspace {
             terminal,
             confirm: None,
             message: Some("Opening local connections…".into()),
+            file_warning: None,
+            file_warnings,
             hosts_visible: true,
             pending: HashMap::new(),
             serial: 0,
             _startup: startup,
+            _file_warnings: warning_task,
             _subscriptions: subscriptions,
         }
     }
@@ -344,7 +364,15 @@ impl Workspace {
             let Some(connections) = self.connections.clone().filter(|_| tab.connected) else {
                 return;
             };
-            tab.files = Some(cx.new(|cx| FilesView::new(tab.attempt, connections, cx)));
+            tab.files = Some(cx.new(|cx| {
+                FilesView::new(
+                    tab.attempt,
+                    connections,
+                    tab.label.clone(),
+                    self.file_warnings.clone(),
+                    cx,
+                )
+            }));
         }
         tab.showing_files = show;
         self.focus_active(window, cx);
@@ -1154,6 +1182,27 @@ impl Render for Workspace {
             .child(toolbar)
             .when_some(self.message.clone(), |root, message| {
                 root.child(div().px_2().py_1().bg(rgb(0x303744)).child(message))
+            })
+            .when_some(self.file_warning.clone(), |root, warning| {
+                root.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x303744))
+                        .child(div().flex_1().min_w_0().child(warning))
+                        .child(Self::button(
+                            cx,
+                            "dismiss-file-warning",
+                            "Dismiss",
+                            |view, _, cx| {
+                                view.file_warning = None;
+                                cx.notify();
+                            },
+                        )),
+                )
             })
             .child(
                 div()

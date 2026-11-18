@@ -109,6 +109,9 @@ impl AttemptFiles {
 
     pub async fn upload(&self, source: &Path, remote: &RemotePath) -> Result<(), FileError> {
         self.check_active()?;
+        if !self.remote.supports_create_only() {
+            return Err(SftpError::NoSafeUpload.into());
+        }
         let mut source = open_regular(source).await?;
         let mut stage = self.remote.stage_write(remote).await?;
         let result = async {
@@ -232,6 +235,17 @@ pub(crate) async fn finish_remote(
 }
 
 pub(crate) async fn open_regular(path: &Path) -> Result<File, FileError> {
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            ["lnk", "url", "website", "scf"]
+                .iter()
+                .any(|shortcut| ext.eq_ignore_ascii_case(shortcut))
+        })
+    {
+        return Err(FileError::NotRegular);
+    }
     let path = path.to_owned();
     let file = tokio::task::spawn_blocking(move || open_regular_file(&path))
         .await

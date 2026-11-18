@@ -15,9 +15,10 @@ use ssh::{PublishMode, RemoteKind, RemoteMetadata, RemotePath, SftpError};
 use tokio::{io::AsyncWrite, runtime::Handle, sync::watch, time::sleep};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use crate::edit_file::WatchFile;
 use crate::{
     AttemptFiles, AttemptId, FileError, ManagerError,
-    file_transfer::{CHUNK, open_regular_file, publish_remote},
+    file_transfer::{CHUNK, publish_remote},
 };
 
 const MAX_EDIT_BYTES: u64 = 32 * 1024 * 1024;
@@ -91,6 +92,7 @@ impl Drop for EditSlot {
 pub(crate) struct EditCopy {
     directory: tempfile::TempDir,
     path: PathBuf,
+    watched: Arc<WatchFile>,
 }
 
 impl EditCopy {
@@ -104,7 +106,12 @@ impl EditCopy {
             .tempdir_in(root)
             .map_err(|_| FileError::LocalWrite)?;
         let path = directory.path().join(name);
-        Ok(Self { directory, path })
+        let watched = Arc::new(WatchFile::new(&path)?);
+        Ok(Self {
+            directory,
+            path,
+            watched,
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -182,11 +189,13 @@ impl PreparedEdit {
     }
 
     pub fn start(self) -> ActiveEdit {
+        let watched = self.copy.watched.clone();
         ActiveEdit {
             files: self.files,
             remote: self.remote,
             version: self.version,
             local: self.copy.keep(),
+            watched,
             _slot: self.slot,
         }
     }
@@ -198,6 +207,7 @@ pub struct ActiveEdit {
     remote: RemotePath,
     version: RemoteVersion,
     local: PathBuf,
+    watched: Arc<WatchFile>,
     _slot: EditSlot,
 }
 
@@ -216,12 +226,13 @@ impl ActiveEdit {
             files,
             remote,
             version,
-            local,
+            watched,
             _slot,
+            ..
         } = self;
         run_watch(
             runtime,
-            &local,
+            &watched,
             (version.digest, version),
             (&files.cancel, &stop),
             &status,
@@ -242,7 +253,7 @@ impl ActiveEdit {
 
 pub(crate) async fn run_watch<State, Tick, Upload>(
     runtime: &Handle,
-    local: &Path,
+    local: &Arc<WatchFile>,
     (mut saved, mut state): (ContentDigest, State),
     (disconnect, stop): (&CancellationToken, &CancellationToken),
     status: &watch::Sender<EditStatus>,
@@ -261,10 +272,10 @@ pub(crate) async fn run_watch<State, Tick, Upload>(
             () = stop.cancelled() => break EditStatus::Finished,
             () = tick() => {}
         }
-        let path = local.to_owned();
+        let watched = local.clone();
         let capture = candidate.is_some();
         let sample = runtime
-            .spawn_blocking(move || sample_local(&path, capture))
+            .spawn_blocking(move || sample_local(&watched, capture))
             .await;
         let sample = match sample {
             Ok(Ok(sample)) => sample,
@@ -324,8 +335,8 @@ pub(crate) struct Snapshot {
     pub(crate) file: File,
 }
 
-pub(crate) fn sample_local(path: &Path, snapshot: bool) -> Result<LocalSample, FileError> {
-    let mut file = open_regular_file(path)?;
+pub(crate) fn sample_local(watched: &WatchFile, snapshot: bool) -> Result<LocalSample, FileError> {
+    let mut file = watched.open()?;
     let mut snapshot = snapshot
         .then(tempfile::tempfile)
         .transpose()

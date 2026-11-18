@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tokio-util = "0.7"
 unicode-segmentation = "1"
 unicode-width = "0.2"
-windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+windows = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_UI_Shell"] }
 zeroize = "1"
 
 [workspace.lints.clippy]

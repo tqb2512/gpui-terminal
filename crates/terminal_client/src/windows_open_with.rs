@@ -5,10 +5,12 @@ use windows::{
         Foundation::{E_ABORT, ERROR_CANCELLED, HWND},
         System::Com::{
             CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-            CoUninitialize,
+            CoTaskMemFree, CoUninitialize,
         },
         UI::Shell::{
-            AttachmentServices, IAttachmentExecute, OAIF_EXEC, OPENASINFO, SHOpenWithDialog,
+            AttachmentServices, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NODEREFERENCELINKS,
+            FileOpenDialog, IAttachmentExecute, IFileDialog, OAIF_EXEC, OPENASINFO,
+            SHOpenWithDialog, SIGDN_FILESYSPATH,
         },
     },
     core::{HSTRING, PCWSTR, w},
@@ -20,6 +22,32 @@ pub(crate) enum OpenWithError {
     Attachment,
     #[error("Windows could not open the app picker.")]
     Picker,
+    #[error("Windows could not open the upload file picker.")]
+    UploadPicker,
+}
+
+pub(crate) fn choose_upload_file(
+    parent: HWND,
+) -> Result<Option<std::path::PathBuf>, OpenWithError> {
+    let _apartment = Apartment::enter(OpenWithError::UploadPicker)?;
+    // The dialog is used on the current STA; the shell-owned path is freed after copying it.
+    (|| unsafe {
+        let dialog: IFileDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetTitle(w!("Upload a file"))?;
+        dialog.SetOptions(
+            dialog.GetOptions()? | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NODEREFERENCELINKS,
+        )?;
+        match dialog.Show(Some(parent)) {
+            Err(error) if error.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
+            result => result?,
+        }
+        let path = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        use std::os::windows::ffi::OsStringExt;
+        let local = std::ffi::OsString::from_wide(path.as_wide());
+        CoTaskMemFree(Some(path.0.cast()));
+        Ok::<_, windows::core::Error>(Some(local.into()))
+    })()
+    .map_err(|_| OpenWithError::UploadPicker)
 }
 
 #[derive(Clone, Copy)]

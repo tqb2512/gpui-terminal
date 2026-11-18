@@ -3,19 +3,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gpui::{
-    Context, FocusHandle, Focusable, IntoElement, PathPromptOptions, Render, Task, Window, div,
-    prelude::*,
-};
+use gpui::{Context, FocusHandle, Focusable, IntoElement, Render, Task, Window, div, prelude::*};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use ssh::{RemoteEntry, RemoteKind, RemotePath};
-use terminal_client::{ActiveEdit, AttemptFiles, AttemptId, Connections, EditStatus};
-use tokio::sync::watch;
+use ssh::{RemoteEntry, RemoteKind, RemotePath, SftpError};
+use terminal_client::{
+    ActiveEdit, AttemptFiles, AttemptId, Connections, EditPause, EditStatus, FileError,
+};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use windows::Win32::Foundation::HWND;
 
 use crate::{
-    windows_open_with::{OpenWithOutcome, choose_application, mark_remote_attachment},
+    windows_open_with::{
+        OpenWithOutcome, choose_application, choose_upload_file, mark_remote_attachment,
+    },
     workspace::Workspace,
 };
 
@@ -46,6 +47,8 @@ pub(crate) fn accept_opened<T, U>(
 pub(crate) struct FilesView {
     attempt: AttemptId,
     connections: Connections,
+    label: String,
+    warnings: mpsc::Sender<String>,
     request: Request,
     focus: FocusHandle,
     files: Option<AttemptFiles>,
@@ -89,11 +92,15 @@ impl FilesView {
     pub(crate) fn new(
         attempt: AttemptId,
         connections: Connections,
+        label: String,
+        warnings: mpsc::Sender<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
             attempt,
             connections,
+            label,
+            warnings,
             request: Request::default(),
             focus: cx.focus_handle(),
             files: None,
@@ -193,29 +200,25 @@ impl FilesView {
         );
     }
 
-    fn upload(&mut self, cx: &mut Context<Self>) {
+    fn upload(&mut self, window: &Window, cx: &mut Context<Self>) {
         let (Some(files), Some(directory)) = (self.files.clone(), self.directory.clone()) else {
             return;
         };
         if self.pending.is_some() || !self.request.is_current() {
             return;
         }
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Upload a file".into()),
-        });
+        let Some(parent) = window_parent(window) else {
+            self.message = Some("Windows could not open the upload file picker.".into());
+            cx.notify();
+            return;
+        };
         let runtime = self.connections.runtime().clone();
         let request = self.request.clone();
+        let label = self.label.clone();
+        let warnings = self.warnings.clone();
         self.run(
             async move {
-                let Some(source) = picker
-                    .await
-                    .map_err(text)?
-                    .map_err(text)?
-                    .and_then(|mut paths| paths.pop())
-                else {
+                let Some(source) = choose_upload_file(parent).map_err(text)? else {
                     return Ok(false);
                 };
                 if !request.is_current() {
@@ -227,11 +230,23 @@ impl FilesView {
                     .ok_or("This filename is not supported.")?;
                 let remote = directory.child(name).map_err(text)?;
                 runtime
-                    .spawn(async move { files.upload(&source, &remote).await })
+                    .spawn(async move {
+                        match files.upload(&source, &remote).await {
+                            Ok(()) => Ok(true),
+                            Err(error) => {
+                                if let Some(warning) = write_warning(&error) {
+                                    let _ = warnings
+                                        .send(format!("{label}: {} — {warning}", remote.as_str()))
+                                        .await;
+                                    Ok(false)
+                                } else {
+                                    Err(text(error))
+                                }
+                            }
+                        }
+                    })
                     .await
                     .map_err(text)?
-                    .map_err(text)?;
-                Ok(true)
             },
             cx,
             |view, uploaded, cx| {
@@ -292,16 +307,11 @@ impl FilesView {
         if self.pending.is_some() || !self.request.is_current() {
             return;
         }
-        let (Ok(parent), Some(root)) = (HasWindowHandle::window_handle(window), edits_root())
-        else {
+        let (Some(hwnd), Some(root)) = (window_parent(window), edits_root()) else {
             self.message = Some("Windows could not prepare an editable copy.".into());
             cx.notify();
             return;
         };
-        let RawWindowHandle::Win32(parent) = parent.as_raw() else {
-            return;
-        };
-        let hwnd = HWND(parent.hwnd.get() as *mut core::ffi::c_void);
         let request = self.request.clone();
         let manager = self.connections.clone();
         let attempt = self.attempt;
@@ -348,10 +358,24 @@ impl FilesView {
         let path = edit.local_path().to_owned();
         let (publish_status, status) = watch::channel(EditStatus::Watching);
         let runtime = self.connections.runtime().clone();
+        let warnings = self.warnings.clone();
+        let mut final_status = status.clone();
+        let description = format!("{}: {name}", self.label);
         runtime.spawn({
             let runtime = runtime.clone();
             let stop = stop.clone();
-            async move { edit.run(&runtime, stop, publish_status).await }
+            async move {
+                edit.run(&runtime, stop, publish_status).await;
+                let warning = match *final_status.borrow_and_update() {
+                    EditStatus::Paused(
+                        reason @ (EditPause::OutcomeUnknown | EditPause::Cleanup),
+                    ) => Some(reason),
+                    _ => None,
+                };
+                if let Some(warning) = warning {
+                    let _ = warnings.send(format!("{description} — {warning}")).await;
+                }
+            }
         });
         let mut changes = status.clone();
         let listen = cx.spawn(async move |weak, cx| {
@@ -368,6 +392,25 @@ impl FilesView {
             status,
             _listen: listen,
         });
+    }
+}
+
+fn window_parent(window: &Window) -> Option<HWND> {
+    let window = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(parent) = window.as_raw() else {
+        return None;
+    };
+    Some(HWND(parent.hwnd.get() as *mut core::ffi::c_void))
+}
+
+pub(crate) fn write_warning(error: &FileError) -> Option<String> {
+    match error {
+        FileError::Remote(
+            SftpError::OutcomeUnknown
+            | SftpError::CleanupFailed
+            | SftpError::PublishedCleanupFailed,
+        ) => Some(text(error)),
+        _ => None,
     }
 }
 
@@ -408,7 +451,7 @@ impl Render for FilesView {
                     cx,
                     "upload",
                     "Upload…",
-                    |view, _, cx| view.upload(cx),
+                    |view, window, cx| view.upload(window, cx),
                 ));
             }
         }

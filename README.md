@@ -59,7 +59,9 @@ forgetting a key revokes all pending attempts that use it.
 Choose **Files** in a connected SSH tab. Browse from the remote home directory
 and use **Upload…** or select a regular file and choose **Download…**. Transfers
 do not overwrite existing destinations. Select **Terminal** to return to the
-shell without disconnecting.
+shell without disconnecting. Upload requires `hardlink@openssh.com` and hard
+links on the destination filesystem so the app can publish without replacing
+an existing file. Browsing and downloads do not require that extension.
 
 **Open with…** copies a supported file (up to 32 MiB) to Windows and prompts for
 a local app. Save normally in that app. The Files view reports when the save
@@ -105,10 +107,11 @@ On a Windows x64 desktop, use an SSH server you control:
    window and verify the app exits. Repeat with the system SSH client absent.
 6. Use Files on two hosts with terminals still active. Upload and download a
    regular file, try a destination that already exists, and cancel each native
-   picker. Open a supported file once in Notepad and once in an editor that saves
-   by replacing the file. Save twice, then test a remote conflict and disconnect
-   during an edit; verify that the local copy survives and reconnect does not
-   send it automatically.
+   picker. Select a Windows shortcut in the upload picker and verify that
+   neither it nor its target is sent. Open a supported file once in Notepad and
+   once in an editor that saves by replacing the file. Save twice, then test a
+   remote conflict and disconnect during an edit; verify that the local copy
+   survives and reconnect does not send it automatically.
 
 See the [project scope and architecture](terminal-client-project.md),
 [architecture diagram](gpui-terminal-architecture.html), and [coding guidelines](AGENTS.md).

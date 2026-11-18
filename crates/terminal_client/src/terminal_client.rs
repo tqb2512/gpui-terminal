@@ -1,6 +1,7 @@
 //! Headless application core shared by the Windows workspace and tests.
 
 mod connections;
+mod edit_file;
 mod file_transfer;
 mod remote_edit;
 #[cfg(test)]

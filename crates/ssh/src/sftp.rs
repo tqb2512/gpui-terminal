@@ -1,8 +1,11 @@
 use std::{
+    io,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -12,6 +15,7 @@ use russh_sftp::{
     protocol::{FileAttributes, FileType, OpenFlags, Packet, StatusCode},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{mpsc, oneshot},
     time::timeout,
 };
@@ -19,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
+const HARDLINK: &str = "hardlink@openssh.com";
 const CHUNK: usize = 16 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_PATH_BYTES: usize = 4096;
@@ -47,6 +52,8 @@ pub enum SftpError {
     Rejected,
     #[error("The server does not support this file operation.")]
     Unsupported,
+    #[error("Safe upload requires the server and filesystem to support hard links.")]
+    NoSafeUpload,
     #[error("Only regular remote files are supported.")]
     NotRegularFile,
     #[error("Only regular remote directories can be browsed.")]
@@ -59,6 +66,8 @@ pub enum SftpError {
     OutcomeUnknown,
     #[error("A remote temporary file or handle may not have been cleaned up.")]
     CleanupFailed,
+    #[error("Uploaded, but the remote temporary file could not be removed.")]
+    PublishedCleanupFailed,
     #[error("The staged file is not ready to publish.")]
     Unsealed,
     #[error("The staged file has already been published.")]
@@ -136,14 +145,14 @@ impl SftpRequests {
     }
 
     pub(crate) async fn serve<H: client::Handler>(mut self, connection: &client::Handle<H>) {
-        let mut client = None;
+        let mut client: Option<Arc<SftpClient>> = None;
         while let Some(reply) = self.receiver.recv().await {
             if reply.is_closed() {
                 continue;
             }
             let result = match &client {
-                Some(client) => Ok(Arc::clone(client)),
-                None => SftpClient::open(connection).await.map(Arc::new),
+                Some(client) if !client.closed.load(Ordering::Acquire) => Ok(Arc::clone(client)),
+                _ => SftpClient::open(connection).await.map(Arc::new),
             };
             if let Ok(opened) = &result {
                 client = Some(opened.clone());
@@ -156,7 +165,9 @@ impl SftpRequests {
 
 pub struct SftpClient {
     session: Arc<RawSftpSession>,
+    closed: Arc<AtomicBool>,
     atomic_replace: bool,
+    create_only: bool,
 }
 
 impl SftpClient {
@@ -173,18 +184,21 @@ impl SftpClient {
                 .request_subsystem(true, "sftp")
                 .await
                 .map_err(|_| SftpError::Disconnected)?;
-            match channel.wait().await {
-                Some(ChannelMsg::Success) => Ok(()),
-                Some(ChannelMsg::Failure) => Err(SftpError::SubsystemUnavailable),
-                Some(ChannelMsg::Close | ChannelMsg::Eof) | None => Err(SftpError::Disconnected),
-                Some(_) => Err(SftpError::Protocol),
+            loop {
+                if let Some(reply) = subsystem_reply(channel.wait().await) {
+                    return reply;
+                }
             }
         })
         .await;
         // The stream owns the channel close even when negotiation is refused.
         let stream = channel.into_stream();
         response.map_err(|_| SftpError::Timeout)??;
-        let session = RawSftpSession::new(stream);
+        let closed = Arc::new(AtomicBool::new(false));
+        let session = RawSftpSession::new(TrackedStream {
+            stream,
+            closed: closed.clone(),
+        });
         let version = session.init().await?;
         if version.version != 3 {
             return Err(SftpError::Protocol);
@@ -192,15 +206,21 @@ impl SftpClient {
 
         Ok(Self {
             session: Arc::new(session),
+            closed,
             atomic_replace: version
                 .extensions
                 .get(POSIX_RENAME)
                 .is_some_and(|v| v == "1"),
+            create_only: version.extensions.get(HARDLINK).is_some_and(|v| v == "1"),
         })
     }
 
     pub fn supports_atomic_replace(&self) -> bool {
         self.atomic_replace
+    }
+
+    pub fn supports_create_only(&self) -> bool {
+        self.create_only
     }
 
     pub async fn home(&self) -> Result<RemotePath, SftpError> {
@@ -316,8 +336,65 @@ impl SftpClient {
             temporary,
             destination: path.clone(),
             atomic_replace: self.atomic_replace,
+            create_only: self.create_only,
             state: WriteState::Writing,
         })
+    }
+}
+
+fn subsystem_reply(message: Option<ChannelMsg>) -> Option<Result<(), SftpError>> {
+    Some(match message {
+        Some(ChannelMsg::Success) => Ok(()),
+        Some(ChannelMsg::Failure) => Err(SftpError::SubsystemUnavailable),
+        Some(ChannelMsg::Close | ChannelMsg::Eof) | None => Err(SftpError::Disconnected),
+        Some(ChannelMsg::WindowAdjusted { .. }) => return None,
+        Some(_) => Err(SftpError::Protocol),
+    })
+}
+
+// The SFTP library owns the stream and doesn't expose a closed-channel query.
+struct TrackedStream<Stream> {
+    stream: Stream,
+    closed: Arc<AtomicBool>,
+}
+
+impl<Stream> Drop for TrackedStream<Stream> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl<Stream: AsyncRead + Unpin> AsyncRead for TrackedStream<Stream> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let count = buffer.filled().len();
+        let can_read = buffer.remaining() != 0;
+        let result = std::task::ready!(Pin::new(&mut self.stream).poll_read(cx, buffer));
+        if result.is_err() || (can_read && buffer.filled().len() == count) {
+            self.closed.store(true, Ordering::Release);
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl<Stream: AsyncWrite + Unpin> AsyncWrite for TrackedStream<Stream> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -481,6 +558,7 @@ pub struct StagedRemoteWrite {
     temporary: RemotePath,
     destination: RemotePath,
     atomic_replace: bool,
+    create_only: bool,
     state: WriteState,
 }
 
@@ -549,34 +627,34 @@ impl StagedRemoteWrite {
             WriteState::Published => return Err(SftpError::Published),
             WriteState::Sealed => {}
         }
-        if mode == PublishMode::AtomicReplace && !self.atomic_replace {
-            return Err(SftpError::Unsupported);
-        }
+        let extension = match mode {
+            PublishMode::CreateOnly if self.create_only => HARDLINK,
+            PublishMode::CreateOnly => return Err(SftpError::NoSafeUpload),
+            PublishMode::AtomicReplace if self.atomic_replace => POSIX_RENAME,
+            PublishMode::AtomicReplace => return Err(SftpError::Unsupported),
+        };
         let old = self.temporary.as_str();
         let new = self.destination.as_str();
+        let mut request = Vec::with_capacity(8 + old.len() + new.len());
+        for path in [old, new] {
+            request.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            request.extend_from_slice(path.as_bytes());
+        }
         // If the future is stopped mid-request, never attempt to publish the same stage again.
         self.state = WriteState::Unknown;
-        let result = match mode {
-            PublishMode::CreateOnly => self.session.rename(old, new).await,
-            PublishMode::AtomicReplace => {
-                let mut request = Vec::with_capacity(8 + old.len() + new.len());
-                for path in [old, new] {
-                    request.extend_from_slice(&(path.len() as u32).to_be_bytes());
-                    request.extend_from_slice(path.as_bytes());
-                }
-                match self.session.extended(POSIX_RENAME, request).await {
-                    Ok(Packet::Status(status)) if status.status_code == StatusCode::Ok => {
-                        Ok(status)
-                    }
-                    Ok(Packet::Status(status)) => Err(status.into()),
-                    Ok(_) => Err(Error::UnexpectedPacket),
-                    Err(error) => Err(error),
-                }
-            }
+        let result = match self.session.extended(extension, request).await {
+            Ok(Packet::Status(status)) if status.status_code == StatusCode::Ok => Ok(()),
+            Ok(Packet::Status(status)) => Err(status.into()),
+            Ok(_) => Err(Error::UnexpectedPacket),
+            Err(error) => Err(error),
         };
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 self.state = WriteState::Published;
+                // Standard SFTP rename can overwrite a late arrival on filesystems without links.
+                if mode == PublishMode::CreateOnly && self.session.remove(old).await.is_err() {
+                    return Err(SftpError::PublishedCleanupFailed);
+                }
                 Ok(())
             }
             Err(Error::Status(status))
@@ -595,6 +673,11 @@ impl StagedRemoteWrite {
                     && self.session.lstat(new).await.is_ok()
                 {
                     return Err(SftpError::AlreadyExists);
+                }
+                if mode == PublishMode::CreateOnly
+                    && status.status_code == StatusCode::OpUnsupported
+                {
+                    return Err(SftpError::NoSafeUpload);
                 }
                 Err(Error::Status(status).into())
             }
@@ -620,5 +703,28 @@ impl StagedRemoteWrite {
         } else {
             Err(SftpError::CleanupFailed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subsystem_reply_ignores_window_update_before_success() {
+        assert!(
+            subsystem_reply(Some(ChannelMsg::WindowAdjusted {
+                new_size: 64 * 1024
+            }))
+            .is_none()
+        );
+        assert!(matches!(
+            subsystem_reply(Some(ChannelMsg::Success)),
+            Some(Ok(()))
+        ));
+        assert!(matches!(
+            subsystem_reply(Some(ChannelMsg::Failure)),
+            Some(Err(SftpError::SubsystemUnavailable))
+        ));
     }
 }
