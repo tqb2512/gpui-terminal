@@ -15,6 +15,7 @@ path = "src/terminal_client.rs"
 [dependencies]
 hosts.workspace = true
 ssh.workspace = true
+terminal.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

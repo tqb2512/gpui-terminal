@@ -6,8 +6,82 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::connections::*;
+use terminal::TerminalInput;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[tokio::test]
+async fn stalled_view_coalesces_redraws_but_not_bytes() -> TestResult {
+    let (events, mut receiver) = tokio::sync::mpsc::channel(4);
+    let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);
+    let host = spec("server", "ops@example.test", AuthMethod::Password)?;
+    let first = core.insert_tab(host.clone())?;
+    let second = core.insert_tab(host)?;
+    let mut left = TabEmulator::new(first.frame, first.id, events.clone(), first.cancel);
+    let mut right = TabEmulator::new(second.frame, second.id, events, second.cancel);
+    left.advance(b"\xe7")?;
+    left.publish();
+    left.advance(b"\x95\x8c!")?;
+    left.publish();
+    right.advance(b"other")?;
+    right.publish();
+    let a = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await?
+        .ok_or(io::Error::other("missing redraw"))?;
+    let b = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await?
+        .ok_or(io::Error::other("missing redraw"))?;
+    assert_ne!(a.attempt, b.attempt);
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        left.frame
+            .read()
+            .ok_or(io::Error::other("no left frame"))?
+            .cells[0]
+            .text,
+        "界"
+    );
+    assert_eq!(
+        right
+            .frame
+            .read()
+            .ok_or(io::Error::other("no right frame"))?
+            .cells[0]
+            .text,
+        "o"
+    );
+    Ok(())
+}
+
+#[test]
+fn oversized_paste_is_rejected_without_partial_input() -> TestResult {
+    let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);
+    let mut launch = core.insert_tab(spec("server", "ops@example.test", AuthMethod::Password)?)?;
+    let sender = launch.frame.clone();
+    assert!(matches!(
+        sender.input(TerminalInput::Paste("x".repeat(1024 * 1024 + 1))),
+        Err(InputError::PasteTooLarge)
+    ));
+    assert!(launch.input.try_recv().is_err());
+    Ok(())
+}
+
+#[test]
+fn close_resolves_even_when_input_or_output_is_full() -> TestResult {
+    let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);
+    let launch = core.insert_tab(spec("server", "ops@example.test", AuthMethod::Password)?)?;
+    let frame = launch.frame.clone();
+    for _ in 0..16 {
+        frame.input(TerminalInput::Paste("x".into()))?;
+    }
+    assert!(matches!(
+        frame.input(TerminalInput::Paste("x".into())),
+        Err(InputError::QueueFull)
+    ));
+    core.close(launch.id.tab)?;
+    assert!(launch.cancel.is_cancelled());
+    Ok(())
+}
 
 fn spec(label: &str, address: &str, auth: AuthMethod) -> Result<ConnectionSpec, ssh::TargetError> {
     Ok(ConnectionSpec {

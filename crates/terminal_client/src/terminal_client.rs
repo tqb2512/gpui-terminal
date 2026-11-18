@@ -3,8 +3,8 @@
 mod connections;
 
 pub use connections::{
-    AttemptId, ConnectionEvent, ConnectionEventKind, ConnectionSpec, Connections, ManagerError,
-    Prompt, PromptId, PromptKind, PromptResponse, TabId,
+    AttemptId, ConnectionEvent, ConnectionEventKind, ConnectionSpec, Connections, InputError,
+    ManagerError, Prompt, PromptId, PromptKind, PromptResponse, TabId,
 };
 
 #[cfg(test)]

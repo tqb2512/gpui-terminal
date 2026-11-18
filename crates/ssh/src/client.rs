@@ -115,6 +115,13 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn split_input(&self) -> InputSender {
+        InputSender {
+            input: self.input.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
     }
@@ -134,6 +141,34 @@ impl Session {
 
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+}
+
+#[derive(Clone)]
+pub struct InputSender {
+    input: mpsc::Sender<Input>,
+    cancel: CancellationToken,
+}
+
+impl InputSender {
+    pub async fn reserve(&self) -> Option<InputPermit<'_>> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => None,
+            permit = self.input.reserve() => permit.ok().map(InputPermit),
+        }
+    }
+}
+
+pub struct InputPermit<'a>(mpsc::Permit<'a, Input>);
+
+impl InputPermit<'_> {
+    pub fn send(self, input: Input) -> Result<(), SendInputError> {
+        if matches!(&input, Input::Bytes(bytes) if bytes.len() > CHUNK) {
+            return Err(SendInputError::TooLarge(input));
+        }
+        self.0.send(input);
+        Ok(())
     }
 }
 
