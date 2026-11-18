@@ -13,7 +13,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{AttemptId, ManagerError};
+use crate::{AttemptId, ManagerError, remote_edit::EditSlots};
 
 pub(crate) const CHUNK: usize = 16 * 1024;
 
@@ -35,6 +35,20 @@ pub enum FileError {
     LocalWrite,
     #[error("Could not clean up an unfinished local download.")]
     LocalCleanup,
+    #[error("The local file is temporarily missing or in use.")]
+    LocalBusy,
+    #[error("This remote filename is not supported by Open with. Use Download instead.")]
+    EditType,
+    #[error("Open with supports files up to 32 MiB. Use Download for larger files.")]
+    EditTooLarge,
+    #[error("This file already has an active local copy.")]
+    EditAlreadyOpen,
+    #[error("Finish editing one of the four active copies before opening another.")]
+    EditLimit,
+    #[error("The remote file changed while the local copy was being prepared.")]
+    EditChanged,
+    #[error("The original file could not be verified for automatic save-back.")]
+    EditUnverifiable,
 }
 
 #[derive(Clone)]
@@ -42,6 +56,7 @@ pub struct AttemptFiles {
     attempt: AttemptId,
     pub(crate) remote: Arc<SftpClient>,
     pub(crate) cancel: CancellationToken,
+    pub(crate) edits: Arc<EditSlots>,
 }
 
 impl AttemptFiles {
@@ -49,11 +64,13 @@ impl AttemptFiles {
         attempt: AttemptId,
         remote: Arc<SftpClient>,
         cancel: CancellationToken,
+        edits: Arc<EditSlots>,
     ) -> Self {
         Self {
             attempt,
             remote,
             cancel,
+            edits,
         }
     }
 
@@ -126,7 +143,7 @@ impl AttemptFiles {
                 }
                 remaining = remaining
                     .checked_sub(length as u64)
-                    .ok_or(FileError::LocalWrite)?;
+                    .ok_or(FileError::EditTooLarge)?;
                 let bytes = buffer.get(..length).ok_or(SftpError::Protocol)?;
                 while_active(&self.cancel, output.write_all(bytes))
                     .await?
@@ -216,40 +233,55 @@ pub(crate) async fn finish_remote(
 
 pub(crate) async fn open_regular(path: &Path) -> Result<File, FileError> {
     let path = path.to_owned();
-    let file = tokio::task::spawn_blocking(move || {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let file = options.open(path).map_err(|_| FileError::LocalRead)?;
-        let metadata = file.metadata().map_err(|_| FileError::LocalRead)?;
-        if !metadata.is_file() {
-            return Err(FileError::NotRegular);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(FileError::NotRegular);
-            }
-        }
-        Ok(file)
-    })
-    .await
-    .map_err(|_| FileError::LocalRead)??;
+    let file = tokio::task::spawn_blocking(move || open_regular_file(&path))
+        .await
+        .map_err(|_| FileError::LocalRead)??;
     Ok(File::from_std(file))
 }
 
+pub(crate) fn open_regular_file(path: &Path) -> Result<std::fs::File, FileError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | 0x0200_0000);
+    }
+    let file = options.open(path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return FileError::NotRegular;
+        }
+        #[cfg(windows)]
+        if matches!(error.raw_os_error(), Some(32 | 33)) {
+            return FileError::LocalBusy;
+        }
+        if error.kind() == io::ErrorKind::NotFound {
+            FileError::LocalBusy
+        } else {
+            FileError::LocalRead
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| FileError::LocalRead)?;
+    if !metadata.is_file() {
+        return Err(FileError::NotRegular);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FileError::NotRegular);
+        }
+    }
+    Ok(file)
+}
 pub(crate) struct LocalDownload {
     pub(crate) file: File,
     stage: tempfile::TempPath,

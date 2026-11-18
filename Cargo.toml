@@ -17,6 +17,7 @@ rand = "0.10"
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0.1"
 rusqlite = { version = "0.43", features = ["bundled"] }
+sha2 = "0.11"
 ssh = { path = "crates/ssh" }
 tempfile = "3"
 terminal = { path = "crates/terminal" }

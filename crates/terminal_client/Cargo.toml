@@ -14,6 +14,7 @@ path = "src/terminal_client.rs"
 
 [dependencies]
 hosts.workspace = true
+sha2.workspace = true
 ssh.workspace = true
 tempfile.workspace = true
 terminal.workspace = true

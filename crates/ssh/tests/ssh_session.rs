@@ -14,8 +14,8 @@ use russh::{
     server::{self, Auth, ChannelOpenHandle, Msg, VerifiedPublicKey},
 };
 use russh_sftp::protocol::{
-    Attrs, Data, File, FileAttributes, Handle as FileHandle, Name, OpenFlags, Status, StatusCode,
-    Version,
+    Attrs, Data, File, FileAttributes, Handle as FileHandle, Name, OpenFlags, Packet, Status,
+    StatusCode, Version,
 };
 use ssh::{
     AuthMethod, Event, Input, PtySize, PublishMode, RemoteKind, RemotePath, Session, SftpClient,
@@ -233,9 +233,11 @@ impl server::Handler for Server {
 #[derive(Default)]
 struct FixtureFiles {
     contents: HashMap<String, Vec<u8>>,
+    modes: HashMap<String, u32>,
     entry_count: usize,
     stall_rename: bool,
     rename_calls: usize,
+    extended_renames: usize,
 }
 
 struct Files {
@@ -319,7 +321,10 @@ impl russh_sftp::server::Handler for Files {
             _ => {
                 let state = self.state.lock().map_err(|_| StatusCode::Failure)?;
                 let bytes = state.contents.get(&path).ok_or(StatusCode::NoSuchFile)?;
-                attributes(0o100644, bytes.len() as u64)
+                attributes(
+                    0o100000 | state.modes.get(&path).copied().unwrap_or(0o644),
+                    bytes.len() as u64,
+                )
             }
         };
         Ok(Attrs { id, attrs })
@@ -343,6 +348,7 @@ impl russh_sftp::server::Handler for Files {
                 return Err(StatusCode::Failure);
             }
             state.contents.insert(filename.clone(), Vec::new());
+            state.modes.insert(filename.clone(), 0o600);
         } else if flags.bits() != OpenFlags::READ.bits() || !state.contents.contains_key(&filename)
         {
             return Err(StatusCode::NoSuchFile);
@@ -354,6 +360,18 @@ impl russh_sftp::server::Handler for Files {
     }
 
     async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+        Ok(ok_status(id))
+    }
+
+    async fn fsetstat(
+        &mut self,
+        id: u32,
+        handle: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        let mode = attrs.permissions.ok_or(StatusCode::Failure)?;
+        *state.modes.get_mut(&handle).ok_or(StatusCode::NoSuchFile)? = mode;
         Ok(ok_status(id))
     }
 
@@ -397,12 +415,12 @@ impl russh_sftp::server::Handler for Files {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        self.state
-            .lock()
-            .map_err(|_| StatusCode::Failure)?
+        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        state
             .contents
             .remove(&filename)
             .ok_or(StatusCode::NoSuchFile)?;
+        state.modes.remove(&filename);
         Ok(ok_status(id))
     }
 
@@ -422,6 +440,9 @@ impl russh_sftp::server::Handler for Files {
                 .contents
                 .remove(&oldpath)
                 .ok_or(StatusCode::NoSuchFile)?;
+            if let Some(mode) = state.modes.remove(&oldpath) {
+                state.modes.insert(newpath.clone(), mode);
+            }
             state.contents.insert(newpath, file);
             state.stall_rename
         };
@@ -429,6 +450,34 @@ impl russh_sftp::server::Handler for Files {
             return std::future::pending().await;
         }
         Ok(ok_status(id))
+    }
+
+    async fn extended(
+        &mut self,
+        id: u32,
+        request: String,
+        data: Vec<u8>,
+    ) -> Result<Packet, Self::Error> {
+        if request != "posix-rename@openssh.com" {
+            return Err(StatusCode::OpUnsupported);
+        }
+        fn read_path<'a>(bytes: &mut &'a [u8]) -> Option<&'a str> {
+            let (length, rest) = bytes.split_first_chunk::<4>()?;
+            let (path, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)?;
+            *bytes = rest;
+            std::str::from_utf8(path).ok()
+        }
+        let mut bytes = data.as_slice();
+        let old = read_path(&mut bytes).ok_or(StatusCode::BadMessage)?;
+        let new = read_path(&mut bytes).ok_or(StatusCode::BadMessage)?;
+        assert!(bytes.is_empty());
+        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        let contents = state.contents.remove(old).ok_or(StatusCode::NoSuchFile)?;
+        let mode = state.modes.remove(old).ok_or(StatusCode::NoSuchFile)?;
+        state.contents.insert(new.to_owned(), contents);
+        state.modes.insert(new.to_owned(), mode);
+        state.extended_renames += 1;
+        Ok(ok_status(id).into())
     }
 }
 
@@ -813,6 +862,38 @@ async fn sftp_aborted_partial_upload_keeps_original() -> TestResult {
         Some(b"old".as_slice())
     );
     assert_eq!(state.rename_calls, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_atomic_publish_preserves_remote_mode_and_replaces_file() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let path = files.home().await?.child("report.txt")?;
+    server
+        .file_state()?
+        .contents
+        .insert(path.as_str().into(), b"old".to_vec());
+    let metadata = files.metadata(&path).await?;
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(b"saved").await?;
+    stage.seal(Some(&metadata)).await?;
+    stage.publish(PublishMode::AtomicReplace).await?;
+
+    let state = server.file_state()?;
+    assert_eq!(state.contents.len(), 1);
+    assert_eq!(
+        state.contents.get(path.as_str()).map(Vec::as_slice),
+        Some(b"saved".as_slice())
+    );
+    assert_eq!(state.extended_renames, 1);
+    assert_eq!(state.rename_calls, 0);
+    drop(state);
+    let after = files.metadata(&path).await?;
+    assert_eq!(
+        (after.mode, after.uid, after.gid),
+        (metadata.mode, metadata.uid, metadata.gid)
+    );
     Ok(())
 }
 

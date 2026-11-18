@@ -20,7 +20,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-use crate::{AttemptFiles, FileError};
+use crate::{AttemptFiles, FileError, remote_edit::EditSlots};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TabId(u64);
@@ -113,6 +113,7 @@ pub struct Connections {
     core: Arc<Mutex<Core>>,
     frames: Frames,
     events: mpsc::Sender<ConnectionEvent>,
+    edits: Arc<EditSlots>,
 }
 
 impl Connections {
@@ -148,6 +149,7 @@ impl Connections {
                 frames: core.frames.clone(),
                 core: Arc::new(Mutex::new(core)),
                 events,
+                edits: Arc::new(EditSlots::default()),
             },
             receiver,
         ))
@@ -193,7 +195,12 @@ impl Connections {
             () = cancel.cancelled() => return Err(FileError::AttemptEnded),
             remote = opener.open() => remote?,
         };
-        Ok(AttemptFiles::new(attempt, remote, cancel))
+        Ok(AttemptFiles::new(
+            attempt,
+            remote,
+            cancel,
+            self.edits.clone(),
+        ))
     }
 
     pub async fn forget_host(&self, endpoint: Endpoint) -> Result<(), ManagerError> {
