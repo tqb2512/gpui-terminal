@@ -17,6 +17,19 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo build --locked -p terminal_client
+      - name: Upload Windows build
+        id: windows-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: terminal-client-windows-x64
+          path: target/debug/terminal_client.exe
+          if-no-files-found: error
+          overwrite: true
+      - name: Add Windows download link
+        env:
+          ARTIFACT_URL: ${{ steps.windows-artifact.outputs.artifact-url }}
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "[Download Windows build (ZIP)]($env:ARTIFACT_URL)"
 
   unsupported-platform:
     runs-on: ubuntu-24.04
