@@ -20,12 +20,13 @@ Check clean-checkout dependency resolution, Windows SDK prerequisites, visible s
 
 ### Task 1: Runnable workspace
 
-- [ ] Create `Cargo.toml`, `rust-toolchain.toml`, `rustfmt.toml`, `.gitignore`, and `crates/{terminal_client,terminal_view,terminal,ssh,hosts}/Cargo.toml`. Use a named `.rs` library root for each library. Generate `Cargo.lock` and confirm `cargo metadata --locked --no-deps` lists all five members.
-- [ ] In `crates/terminal_client/src/main.rs` open the workspace window, handle startup errors, and quit when the last window closes. Implement the workspace root in `crates/terminal_client/src/workspace.rs` using the empty state from `crates/terminal_view/src/terminal_view.rs`. Leave the three backend library roots free of speculative APIs.
-- [ ] Build `cargo build --locked -p terminal_client` on Windows. Launch, resize, and close the window on a Windows desktop; verify the message remains visible and the process exits. Record which checks were possible.
+- [x] Create `Cargo.toml`, `rust-toolchain.toml`, `rustfmt.toml`, `.gitignore`, and `crates/{terminal_client,terminal_view,terminal,ssh,hosts}/Cargo.toml`. Use a named `.rs` library root for each library. Generate `Cargo.lock` and confirm `cargo metadata --locked --no-deps` lists all five members.
+- [x] In `crates/terminal_client/src/main.rs` open the workspace window, handle startup errors, and quit when the last window closes. Implement the workspace root in `crates/terminal_client/src/workspace.rs` using the empty state from `crates/terminal_view/src/terminal_view.rs`. Leave the three backend library roots free of speculative APIs.
+- [x] Cross-build a linked `x86_64-pc-windows-msvc` executable from Linux with `cargo xwin build --locked --target x86_64-pc-windows-msvc -p terminal_client`.
+- [ ] Run the native Windows CI build and the launch, resize, and close smoke check in `README.md`.
 
 ### Task 2: Maintainer instructions and CI
 
-- [ ] Create `AGENTS.md` with applicable Zed Rust and GPUI conventions, crate boundaries, error handling, and SSH trust requirements. Link the upstream guidance and existing scope rather than copying Zed-specific scripts.
-- [ ] Create `README.md` with Windows toolchain prerequisites, launch command, current scope, and smoke check. Add `.github/workflows/ci.yml` on a Windows runner for formatting, locked Clippy, workspace tests, and a linked application build.
-- [ ] Check all documented commands against the workflow and manifests. Report local results separately from checks awaiting a Windows runner.
+- [x] Create `AGENTS.md` with applicable Zed Rust and GPUI conventions, crate boundaries, error handling, and SSH trust requirements. Link the upstream guidance and existing scope rather than copying Zed-specific scripts.
+- [x] Create `README.md` with Windows toolchain prerequisites, launch command, current scope, and smoke check. Add `.github/workflows/ci.yml` on a Windows runner for formatting, locked Clippy, workspace tests, and a linked application build.
+- [x] Check all documented commands against the workflow and manifests. Report local results separately from checks awaiting a Windows runner.

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust + GPUI Terminal Client | MVP Architecture</title>
+<style>
+  *{box-sizing:border-box} body{margin:0;padding:clamp(1rem,4vw,3rem);background:#020617;color:#f8fafc;font:16px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace} main{max-width:1060px;margin:auto} h1{font-size:clamp(1.35rem,4vw,2rem);margin:0} header p,article p,footer{color:#a7b5c8} .eyebrow{color:#67e8f9;font-size:.76rem;letter-spacing:.12em;text-transform:uppercase;margin:0 0 .4rem} header{margin-bottom:1.2rem} header p:last-child{margin:.4rem 0 0} .frame,article{border:1px solid #233249;background:#0b1220;border-radius:12px} .frame{overflow:auto} svg{width:100%;min-width:760px;display:block} svg text{fill:#e2e8f0} .cap{font-size:11px;letter-spacing:1.2px;font-weight:700} .name{font-size:16px;font-weight:700} .detail,.edge-label{font-size:12px;fill:#afbed2} .edge{fill:none;stroke:#8293ad;stroke-width:1.65} .trust{stroke:#fb7185;stroke-dasharray:5 4} .node{stroke-width:1.5} .ui{fill:#0c2a3b;stroke:#22d3ee} .core{fill:#102d29;stroke:#34d399} .store{fill:#26203e;stroke:#a78bfa} .security{fill:#351c2e;stroke:#fb7185} .external{fill:#1a2537;stroke:#94a3b8} .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin-top:16px} article{padding:1rem} article h2{color:#e2e8f0;font-size:.9rem;margin:0 0 .3rem} article p,footer{font-size:.8rem;margin:0} footer{margin-top:1.2rem}
+</style>
+</head>
+<body>
+<main>
+  <header><p class="eyebrow">Desktop architecture &middot; MVP</p><h1>Rust + GPUI terminal client</h1><p>Embedded SSH with Russh; no system SSH executable required.</p></header>
+  <div class="frame" tabindex="0" aria-label="Architecture diagram, scroll horizontally on small screens">
+    <svg viewBox="0 0 960 640" role="img" aria-labelledby="arch-title arch-description" xmlns="http://www.w3.org/2000/svg">
+      <title id="arch-title">MVP component and data flow</title>
+      <desc id="arch-description">GPUI talks to a session manager and a profile repository. Each tab has an emulator and either an embedded Russh backend or a local PTY adapter. Russh connects to a remote server and calls the app's host-key verifier. The local PTY adapter runs a local shell process.</desc>
+      <defs>
+        <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#1b2a3f" stroke-width="1"/></pattern>
+        <marker id="arrow" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto-start-reverse"><path d="M0 0L9 4L0 8Z" fill="#8293ad"/></marker>
+        <marker id="rose-arrow" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0L9 4L0 8Z" fill="#fb7185"/></marker>
+      </defs>
+      <rect width="960" height="640" fill="url(#grid)"/>
+      <rect x="24" y="22" width="912" height="507" rx="12" fill="#0f172a" fill-opacity=".68" stroke="#48617d" stroke-dasharray="8 4"/>
+      <text class="cap" x="45" y="49">RUST DESKTOP PROCESS</text>
+      <rect x="52" y="273" width="856" height="230" rx="9" fill="#0b1723" stroke="#2d715e" stroke-dasharray="5 4"/>
+      <text class="cap" x="70" y="295">PER SESSION: TERMINAL CORE + ONE BACKEND</text>
+      <text class="cap" x="45" y="560">EXTERNAL TO THE APP</text>
+
+      <path class="edge" d="M270 128V176" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge" d="M476 96H592" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge" d="M744 128V176" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge" d="M270 240V352" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge" d="M406 384H444V348H476" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge" d="M444 384V448H476" marker-end="url(#arrow)"/>
+      <path class="edge" d="M588 480V573" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path class="edge trust" d="M700 338H746" marker-end="url(#rose-arrow)"/>
+      <path class="edge trust" d="M820 316V240" marker-end="url(#rose-arrow)"/>
+      <path class="edge" d="M700 366H724V542H812V573" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+
+      <rect class="node ui" x="64" y="64" width="412" height="64" rx="8"/>
+      <text class="name" x="82" y="91">GPUI desktop</text><text class="detail" x="82" y="112">Host sidebar, tabs and terminal rendering</text>
+      <rect class="node core" x="64" y="176" width="412" height="64" rx="8"/>
+      <text class="name" x="82" y="203">Session manager</text><text class="detail" x="82" y="224">Session IDs, lifecycle and reconnect</text>
+      <rect class="node store" x="592" y="64" width="304" height="64" rx="8"/>
+      <text class="name" x="610" y="91">Host repository</text><text class="detail" x="610" y="112">Typed connection profiles and settings</text>
+      <rect class="node store" x="592" y="176" width="304" height="64" rx="8"/>
+      <text class="name" x="610" y="203">SQLite</text><text class="detail" x="610" y="224">Profiles + public host keys; no secrets</text>
+      <rect class="node core" x="80" y="352" width="326" height="64" rx="8"/>
+      <text class="name" x="98" y="379">Terminal core</text><text class="detail" x="98" y="399">Grid, scrollback and key encoding</text>
+      <rect class="node core" x="476" y="316" width="224" height="64" rx="8"/>
+      <text class="name" x="494" y="343">Embedded SSH</text><text class="detail" x="494" y="363">Russh + Tokio; remote PTY</text>
+      <rect class="node core" x="476" y="416" width="224" height="64" rx="8"/>
+      <text class="name" x="494" y="443">Local PTY adapter</text><text class="detail" x="494" y="463">portable-pty; child process</text>
+      <rect class="node security" x="746" y="316" width="148" height="64" rx="8"/>
+      <text class="name" x="758" y="343">Host-key policy</text><text class="detail" x="758" y="363">Verify before auth</text>
+      <rect class="node external" x="476" y="573" width="224" height="52" rx="8"/>
+      <text class="name" x="494" y="595">Local shell</text><text class="detail" x="494" y="613">Child process</text>
+      <rect class="node external" x="734" y="573" width="160" height="52" rx="8"/>
+      <text class="name" x="750" y="595">Remote server</text><text class="detail" x="750" y="613">SSH over TCP</text>
+
+      <text class="edge-label" x="283" y="155">Commands / UI updates</text>
+      <text class="edge-label" x="756" y="155">Local reads / writes</text>
+      <text class="edge-label" x="283" y="263">Control / render snapshots</text>
+      <text class="edge-label" x="448" y="407">Bytes / resize</text>
+      <text class="edge-label" x="596" y="522">Local PTY</text>
+      <text class="edge-label" x="752" y="535">SSH</text>
+    </svg>
+  </div>
+  <div class="cards">
+    <article><h2>UI stays responsive</h2><p>Network, PTY, and database I/O run off the UI thread. Coalesce redraws, not terminal bytes.</p></article>
+    <article><h2>Typed connection events</h2><p>The backend reports connection stages and errors, and sends host-key and authentication prompts to GPUI separately from terminal output.</p></article>
+    <article><h2>The app owns trust</h2><p>Verify the server before authenticating. Confirm unknown fingerprints, block changed keys, and never persist passwords or raw terminal output.</p></article>
+  </div>
+  <footer>MVP boundary: Windows OS, no cloud service, no SFTP, no automatic command replay.</footer>
+</main>
+</body>
+</html>
