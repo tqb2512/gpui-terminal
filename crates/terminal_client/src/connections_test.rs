@@ -10,6 +10,30 @@ use terminal::TerminalInput;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn files_require_a_current_connected_attempt() -> TestResult {
+    use crate::FileError;
+
+    let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);
+    let launch = core.insert_tab(spec("server", "ops@example.test", AuthMethod::Password)?)?;
+    assert!(matches!(
+        core.file_access(launch.id),
+        Err(FileError::AttemptEnded)
+    ));
+    core.on_event(launch.id, Event::Connected)?;
+    let second = core.reconnect(launch.id.tab)?;
+    assert!(matches!(
+        core.file_access(launch.id),
+        Err(FileError::AttemptEnded)
+    ));
+    core.on_event(second.id, Event::Ended(Ok(())))?;
+    assert!(matches!(
+        core.file_access(second.id),
+        Err(FileError::AttemptEnded)
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn only_one_controller_can_open_a_connection_store() -> TestResult {
     let directory = tempfile::tempdir()?;

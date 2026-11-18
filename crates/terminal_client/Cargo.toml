@@ -15,14 +15,15 @@ path = "src/terminal_client.rs"
 [dependencies]
 hosts.workspace = true
 ssh.workspace = true
+tempfile.workspace = true
 terminal.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 zeroize.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 gpui.workspace = true

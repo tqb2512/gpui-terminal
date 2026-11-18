@@ -11,7 +11,7 @@ use std::{
 };
 
 use hosts::{Approval, KeyCheck, Profile, ProfileDraft, ProfileId, Repository, StoreError};
-use ssh::{AuthMethod, Endpoint, Event, Input, PtySize, Target};
+use ssh::{AuthMethod, Endpoint, Event, Input, PtySize, SftpOpener, Target};
 use terminal::{Snapshot, Terminal, TerminalInput};
 use tokio::{
     runtime::Handle,
@@ -20,10 +20,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::{AttemptFiles, FileError};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TabId(u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AttemptId {
     pub tab: TabId,
     serial: u64,
@@ -182,6 +184,18 @@ impl Connections {
         self.work(move |core| core.close(tab)).await
     }
 
+    pub async fn files(&self, attempt: AttemptId) -> Result<AttemptFiles, FileError> {
+        let (opener, cancel) = self
+            .work(move |core| Ok(core.file_access(attempt)))
+            .await??;
+        let remote = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(FileError::AttemptEnded),
+            remote = opener.open() => remote?,
+        };
+        Ok(AttemptFiles::new(attempt, remote, cancel))
+    }
+
     pub async fn forget_host(&self, endpoint: Endpoint) -> Result<(), ManagerError> {
         let events = self.events.clone();
         self.work(move |core| core.forget_host(&endpoint))
@@ -282,6 +296,7 @@ impl Connections {
                 PtySize { columns: 80, rows: 24, pixel_width: 0, pixel_height: 0 },
             );
             let writer = session.split_input();
+            let sftp = session.sftp_opener();
             let attempt = launch.id;
             let mut emulator = TabEmulator::new(launch.frame, attempt, events.clone(), launch.cancel.clone());
             let mut pending = VecDeque::new();
@@ -334,7 +349,11 @@ impl Connections {
                     }
                 }
                 let Some(state) = core.upgrade() else { break; };
+                let sftp = matches!(&event, Event::Connected).then(|| sftp.clone());
                 let result = work(&runtime, state, move |core| {
+                    if let Some(sftp) = sftp {
+                        core.bind_files(attempt, sftp);
+                    }
                     match core.on_event(attempt, event) {
                         Ok(kind) => Ok(kind),
                         Err(error) => {
@@ -411,6 +430,8 @@ struct Tab {
     spec: ConnectionSpec,
     attempt: AttemptId,
     cancel: CancellationToken,
+    file_cancel: CancellationToken,
+    sftp: Option<SftpOpener>,
     established: bool,
     ended: bool,
     prompt: Option<(PromptId, Pending)>,
@@ -497,6 +518,8 @@ impl Core {
             spec: spec.clone(),
             attempt,
             cancel: cancel.clone(),
+            file_cancel: cancel.child_token(),
+            sftp: None,
             established: false,
             ended: false,
             prompt: None,
@@ -520,6 +543,31 @@ impl Core {
             .map_err(|_| ManagerError::Unavailable)?
             .remove(&tab);
         Ok(())
+    }
+
+    fn bind_files(&mut self, attempt: AttemptId, sftp: SftpOpener) {
+        if let Some(tab) = self
+            .tabs
+            .get_mut(&attempt.tab)
+            .filter(|tab| tab.attempt == attempt && !tab.ended)
+        {
+            tab.sftp = Some(sftp);
+        }
+    }
+
+    pub(crate) fn file_access(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<(SftpOpener, CancellationToken), FileError> {
+        let tab = self
+            .tabs
+            .get(&attempt.tab)
+            .filter(|tab| tab.attempt == attempt && tab.established && !tab.ended)
+            .ok_or(FileError::AttemptEnded)?;
+        Ok((
+            tab.sftp.clone().ok_or(FileError::AttemptEnded)?,
+            tab.file_cancel.clone(),
+        ))
     }
 
     pub(crate) fn forget_host(
@@ -616,6 +664,8 @@ impl Core {
         {
             tab.ended = true;
             tab.established = false;
+            tab.file_cancel.cancel();
+            tab.sftp = None;
             tab.frame.connected.store(false, Ordering::Release);
             tab.prompt = None;
         }

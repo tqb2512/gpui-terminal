@@ -794,6 +794,29 @@ async fn sftp_streams_regular_files_without_following_special_entries() -> TestR
 }
 
 #[tokio::test]
+async fn sftp_aborted_partial_upload_keeps_original() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let path = files.home().await?.child("report.txt")?;
+    server
+        .file_state()?
+        .contents
+        .insert(path.as_str().into(), b"old".to_vec());
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(b"partial").await?;
+    timeout(DEADLINE, stage.abort()).await??;
+
+    let state = server.file_state()?;
+    assert_eq!(state.contents.len(), 1);
+    assert_eq!(
+        state.contents.get(path.as_str()).map(Vec::as_slice),
+        Some(b"old".as_slice())
+    );
+    assert_eq!(state.rename_calls, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn password_requires_approved_host_before_auth() -> TestResult {
     let (server, _) = fixture().await?;
     let mut session = server.connect(AuthMethod::Password);
