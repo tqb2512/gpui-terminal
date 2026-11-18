@@ -9,7 +9,15 @@ publish.workspace = true
 path = "src/ssh.rs"
 
 [dependencies]
+russh.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1,7 +1,9 @@
 //! SSH transport and host verification.
 
+mod client;
 mod target;
 
+pub use client::{Event, Input, PtySize, SendInputError, Session, SessionError, connect};
 pub use target::{AuthMethod, Endpoint, Target, TargetError};
 
 #[cfg(test)]
