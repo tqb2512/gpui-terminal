@@ -93,6 +93,8 @@ pub enum SessionError {
     KeyDecode,
     #[error("The SSH server refused the remote PTY or shell.")]
     Shell,
+    #[error("The SSH server sent too much terminal output before accepting the shell.")]
+    EarlyOutput,
     #[error("The SSH connection failed or was interrupted.")]
     Protocol,
     #[error("The private key could not be processed.")]
@@ -351,24 +353,25 @@ async fn run(
             &[],
         )
         .await?;
-    expect_success(&mut channel).await?;
+    let mut early_output = Vec::new();
+    expect_success(&mut channel, &mut early_output).await?;
     channel.request_shell(true).await?;
-    expect_success(&mut channel).await?;
+    expect_success(&mut channel, &mut early_output).await?;
     events
         .send(Event::Connected)
         .await
         .map_err(|_| SessionError::Cancelled)?;
+    forward_output(events, &early_output).await?;
+    drop(early_output);
     let (mut reader, writer) = channel.split();
     tokio::select! {
         result = async {
             while let Some(message) = reader.wait().await {
                 match message {
                     ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                        for chunk in data.chunks(CHUNK) {
-                            events.send(Event::Output(chunk.to_vec())).await.map_err(|_| SessionError::Cancelled)?;
-                        }
+                        forward_output(events, &data).await?;
                     }
-                    ChannelMsg::Close | ChannelMsg::Eof => return Ok(()),
+                    ChannelMsg::Close => return Ok(()),
                     _ => {}
                 }
             }
@@ -389,14 +392,39 @@ async fn run(
     }
 }
 
-async fn expect_success(channel: &mut Channel<client::Msg>) -> Result<(), SessionError> {
-    match timeout(REQUEST_TIMEOUT, channel.wait())
-        .await
-        .map_err(|_| SessionError::Timeout)?
-    {
-        Some(ChannelMsg::Success) => Ok(()),
-        _ => Err(SessionError::Shell),
+async fn forward_output(events: &mpsc::Sender<Event>, bytes: &[u8]) -> Result<(), SessionError> {
+    for chunk in bytes.chunks(CHUNK) {
+        events
+            .send(Event::Output(chunk.to_vec()))
+            .await
+            .map_err(|_| SessionError::Cancelled)?;
     }
+    Ok(())
+}
+
+async fn expect_success(
+    channel: &mut Channel<client::Msg>,
+    early_output: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    timeout(REQUEST_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure | ChannelMsg::Close) | None => {
+                    return Err(SessionError::Shell);
+                }
+                Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
+                    if data.len() > (64 * 1024usize).saturating_sub(early_output.len()) {
+                        return Err(SessionError::EarlyOutput);
+                    }
+                    early_output.extend_from_slice(&data);
+                }
+                Some(_) => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| SessionError::Timeout)?
 }
 
 async fn load_key(path: PathBuf, events: &mpsc::Sender<Event>) -> Result<PrivateKey, SessionError> {

@@ -11,6 +11,77 @@ use terminal::TerminalInput;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[tokio::test]
+async fn only_one_controller_can_open_a_connection_store() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let runtime = tokio::runtime::Handle::current();
+    let (first, _) = Connections::open(&runtime, directory.path()).await?;
+    assert!(matches!(
+        Connections::open(&runtime, directory.path()).await,
+        Err(ManagerError::AlreadyRunning)
+    ));
+    drop(first);
+    assert!(Connections::open(&runtime, directory.path()).await.is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_input_and_event_queues_apply_backpressure_until_drain_or_cancel() -> TestResult {
+    use std::{collections::VecDeque, time::Duration};
+    use tokio::{sync::mpsc, time::timeout};
+    use tokio_util::sync::CancellationToken;
+
+    let (outgoing, mut incoming) = mpsc::channel(1);
+    outgoing
+        .send(Event::Output(b"ordinary output".to_vec()))
+        .await
+        .map_err(|_| io::Error::other("fixture closed"))?;
+    let mut pending = VecDeque::new();
+    for _ in 0..256 {
+        pending.push_back(ssh::Input::Bytes(b"paste".to_vec()));
+    }
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            recv_with_backpressure(&pending, incoming.recv())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(pending.len(), 256);
+    assert!(matches!(pending.pop_front(), Some(ssh::Input::Bytes(bytes)) if bytes == b"paste"));
+    let event = timeout(
+        Duration::from_secs(2),
+        recv_with_backpressure(&pending, incoming.recv()),
+    )
+    .await?;
+    assert!(matches!(event, Some(Event::Output(bytes)) if bytes == b"ordinary output"));
+
+    let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);
+    let launch = core.insert_tab(spec("server", "ops@example.test", AuthMethod::Password)?)?;
+    let (events, mut consumer) = mpsc::channel(1);
+    let redraw = || ConnectionEvent {
+        attempt: launch.id,
+        kind: ConnectionEventKind::Redraw,
+    };
+    events
+        .send(redraw())
+        .await
+        .map_err(|_| io::Error::other("fixture closed"))?;
+    let cancel = CancellationToken::new();
+    let mut blocked = std::pin::pin!(send_event(&events, &cancel, redraw()));
+    assert!(
+        timeout(Duration::from_millis(20), &mut blocked)
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    assert!(!timeout(Duration::from_secs(2), blocked).await?);
+    assert!(consumer.try_recv().is_ok());
+    assert!(consumer.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn stalled_view_coalesces_redraws_but_not_bytes() -> TestResult {
     let (events, mut receiver) = tokio::sync::mpsc::channel(4);
     let mut core = Core::new(Repository::open(std::path::Path::new(":memory:"))?);

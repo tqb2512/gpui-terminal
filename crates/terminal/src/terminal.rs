@@ -12,6 +12,8 @@ use alacritty_terminal::{
     term::{Config, Osc52, TermMode, cell::Flags, color::Colors},
     vte::ansi::{Color, NamedColor, Processor},
 };
+mod limits;
+use limits::{BoundedInput, ControlSequence};
 
 const PALETTE: [u32; 16] = [
     0x181b20, 0xd96b69, 0x92c781, 0xf0c674, 0x85aef2, 0xc49ae8, 0x7ccacf, 0xd3d8e0, 0x626d7c,
@@ -24,6 +26,15 @@ pub struct Terminal {
     grid: Term<Replies>,
     parser: Processor,
     replies: Replies,
+    control: ControlSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TerminalError {
+    #[error("The remote terminal sent an oversized control sequence.")]
+    ControlSequence,
+    #[error("The remote terminal sent too many combining marks for one cell.")]
+    CombiningMarks,
 }
 
 #[derive(Clone, Copy)]
@@ -134,11 +145,15 @@ impl Terminal {
             grid: Term::new(config, &Size::new(columns, rows), replies.clone()),
             parser: Processor::new(),
             replies,
+            control: ControlSequence::default(),
         }
     }
 
-    pub fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.grid, bytes);
+    pub fn advance(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.control.check(bytes)?;
+        let mut input = BoundedInput::new(&mut self.grid);
+        self.parser.advance(&mut input, bytes);
+        input.result()
     }
 
     pub fn take_replies(&self) -> Vec<u8> {
@@ -375,23 +390,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_utf8_and_escape_sequences_render_in_order() {
+    fn rejects_oversized_osc_across_reads() -> Result<(), TerminalError> {
+        let mut term = Terminal::new(80, 24);
+        term.advance(b"\x1b")?;
+        term.advance(b"]0;")?;
+        term.advance(&[b'a'; 4096])?;
+        assert_eq!(
+            term.advance(&[b'a'; 4096]),
+            Err(TerminalError::ControlSequence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_combining_overflow_even_with_cursor_movement_or_repeat() -> Result<(), TerminalError>
+    {
+        let mut term = Terminal::new(80, 24);
+        term.advance("a\u{301}".as_bytes())?;
+        for _ in 0..15 {
+            term.advance("\x1b[2G\u{301}".as_bytes())?;
+        }
+        assert_eq!(
+            term.advance(b"\x1b[64b"),
+            Err(TerminalError::CombiningMarks)
+        );
+        assert_eq!(term.snapshot().cells[0].text.chars().count(), 17);
+        Ok(())
+    }
+
+    #[test]
+    fn split_utf8_and_escape_sequences_render_in_order() -> Result<(), TerminalError> {
         let mut term = Terminal::new(8, 2);
-        term.advance(b"\x1b[38;2;12;");
-        term.advance(b"34;56m\xe7");
-        term.advance(b"\x95\x8c");
+        term.advance(b"\x1b[38;2;12;")?;
+        term.advance(b"34;56m\xe7")?;
+        term.advance(b"\x95\x8c")?;
         let frame = term.snapshot();
         assert_eq!(frame.cells[0].text, "界");
         assert_eq!(frame.cells[0].foreground, 0x0c2238);
         assert_eq!(frame.cells[0].width, 2);
         assert_eq!(frame.cursor.map(|cursor| cursor.column), Some(2));
+        Ok(())
     }
 
     #[test]
-    fn history_is_bounded_and_copy_excludes_cell_padding() {
+    fn history_is_bounded_and_copy_excludes_cell_padding() -> Result<(), TerminalError> {
         let mut term = Terminal::new(12, 2);
         for line in 0..10_100 {
-            term.advance(format!("{line:05}\r\n").as_bytes());
+            term.advance(format!("{line:05}\r\n").as_bytes())?;
         }
         term.scroll(i32::MAX);
         let frame = term.snapshot();
@@ -410,10 +455,11 @@ mod tests {
             end: (0, 11),
         }));
         assert_eq!(term.selected_text().as_deref(), Some("00099"));
+        Ok(())
     }
 
     #[test]
-    fn key_and_paste_follow_terminal_modes() {
+    fn key_and_paste_follow_terminal_modes() -> Result<(), TerminalError> {
         let mut term = Terminal::new(80, 24);
         let up = KeyStroke {
             key: "up".into(),
@@ -421,8 +467,9 @@ mod tests {
         };
         assert_eq!(term.encode_key(&up).as_deref(), Some(b"\x1b[A".as_slice()));
         assert_eq!(term.encode_paste("a\nb"), b"a\rb");
-        term.advance(b"\x1b[?1h\x1b[?2004h");
+        term.advance(b"\x1b[?1h\x1b[?2004h")?;
         assert_eq!(term.encode_key(&up).as_deref(), Some(b"\x1bOA".as_slice()));
         assert_eq!(term.encode_paste("a\nb"), b"\x1b[200~a\nb\x1b[201~");
+        Ok(())
     }
 }

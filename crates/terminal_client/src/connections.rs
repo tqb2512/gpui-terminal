@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fs::{File, OpenOptions, TryLockError},
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -83,6 +85,8 @@ pub enum ManagerError {
     Session(#[from] ssh::SessionError),
     #[error("Could not open the local connection data folder.")]
     Directory,
+    #[error("Another GPUI Terminal Client instance is using this connection store.")]
+    AlreadyRunning,
     #[error("The connection manager is unavailable.")]
     Unavailable,
     #[error("This tab is closed.")]
@@ -97,8 +101,8 @@ pub enum ManagerError {
     ChangedKey(Endpoint),
     #[error("The trusted host key was forgotten; connect again to verify the host.")]
     Forgotten,
-    #[error("The SSH terminal stopped processing input.")]
-    TerminalInput,
+    #[error(transparent)]
+    Terminal(#[from] terminal::TerminalError),
 }
 
 #[derive(Clone)]
@@ -115,15 +119,27 @@ impl Connections {
         directory: &Path,
     ) -> Result<(Self, mpsc::Receiver<ConnectionEvent>), ManagerError> {
         let directory = directory.to_owned();
-        let repository = runtime
+        let core = runtime
             .spawn_blocking(move || {
                 std::fs::create_dir_all(&directory).map_err(|_| ManagerError::Directory)?;
-                Ok::<_, ManagerError>(Repository::open(&directory.join("connections.sqlite3"))?)
+                let lock = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(directory.join("connections.lock"))
+                    .map_err(|_| ManagerError::Directory)?;
+                match lock.try_lock() {
+                    Ok(()) => {}
+                    Err(TryLockError::WouldBlock) => return Err(ManagerError::AlreadyRunning),
+                    Err(TryLockError::Error(_)) => return Err(ManagerError::Directory),
+                }
+                let mut core = Core::new(Repository::open(&directory.join("connections.sqlite3"))?);
+                core._instance_lock = Some(lock);
+                Ok(core)
             })
             .await
             .map_err(|_| ManagerError::Unavailable)??;
         let (events, receiver) = mpsc::channel(64);
-        let core = Core::new(repository);
         Ok((
             Self {
                 runtime: runtime.clone(),
@@ -275,7 +291,8 @@ impl Connections {
             loop {
                 let event = tokio::select! {
                     () = launch.cancel.cancelled() => break,
-                    event = session.recv() => event.unwrap_or(Event::Ended(Err(ssh::SessionError::Protocol))),
+                    event = recv_with_backpressure(&pending, session.recv()) =>
+                        event.unwrap_or(Event::Ended(Err(ssh::SessionError::Protocol))),
                     permit = writer.reserve(), if !pending.is_empty() => {
                         match (permit, pending.pop_front()) {
                             (Some(permit), Some(input)) if !launch.cancel.is_cancelled() => {
@@ -299,18 +316,19 @@ impl Connections {
                 };
                 if let Event::Output(bytes) = event {
                     match emulator.advance(&bytes) {
-                        Ok(replies) if pending.len() < 256 => {
+                        Ok(replies) => {
                             enqueue_bytes(&mut pending, &replies);
                             dirty = true;
                             continue;
                         }
-                        Ok(_) | Err(_) => {
-                            let kind = ConnectionEventKind::Ended(Err(ManagerError::TerminalInput));
+                        Err(error) => {
+                            let kind = ConnectionEventKind::Ended(Err(error));
                             session.cancel();
                             if let Some(state) = core.upgrade() {
                                 let _ = work(&runtime, state, move |core| { core.end(attempt); Ok(()) }).await;
                             }
-                            let _ = events.send(ConnectionEvent { attempt, kind }).await;
+                            emulator.publish();
+                            send_event(&events, &launch.cancel, ConnectionEvent { attempt, kind }).await;
                             break;
                         }
                     }
@@ -336,14 +354,33 @@ impl Connections {
                     emulator.publish();
                     dirty = false;
                 }
-                let sent = tokio::select! {
-                    biased;
-                    () = launch.cancel.cancelled() => break,
-                    result = events.send(ConnectionEvent { attempt, kind }) => result,
-                };
-                if ended || sent.is_err() { break; }
+                let sent = send_event(&events, &launch.cancel, ConnectionEvent { attempt, kind }).await;
+                if ended || !sent { break; }
             }
         });
+    }
+}
+
+pub(crate) async fn recv_with_backpressure(
+    pending: &VecDeque<Input>,
+    receive: impl Future<Output = Option<Event>>,
+) -> Option<Event> {
+    if pending.len() >= 256 {
+        // Keep one bounded output chunk in the transport, not a growing queue of terminal replies.
+        return std::future::pending().await;
+    }
+    receive.await
+}
+
+pub(crate) async fn send_event(
+    events: &mpsc::Sender<ConnectionEvent>,
+    cancel: &CancellationToken,
+    event: ConnectionEvent,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        sent = events.send(event) => sent.is_ok(),
     }
 }
 
@@ -366,6 +403,8 @@ pub(crate) struct Core {
     serial: u64,
     tabs: HashMap<TabId, Tab>,
     frames: Frames,
+    // Drop pending prompts and cancel the tabs before releasing the store.
+    _instance_lock: Option<File>,
 }
 
 struct Tab {
@@ -401,6 +440,7 @@ impl Core {
     pub(crate) fn new(repository: Repository) -> Self {
         Self {
             repository,
+            _instance_lock: None,
             serial: 0,
             tabs: HashMap::new(),
             frames: Frames::default(),
@@ -724,7 +764,7 @@ impl TabEmulator {
     }
 
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ManagerError> {
-        self.terminal.advance(bytes);
+        self.terminal.advance(bytes)?;
         Ok(self.terminal.take_replies())
     }
 

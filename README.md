@@ -12,6 +12,8 @@ and select **Download Windows build (ZIP)** in the summary. Sign in to GitHub
 with repository access, then extract and run `terminal_client.exe`. Avoid
 running executables from pull requests you don't trust. The download expires
 according to the repository's artifact retention policy.
+If Windows reports that `VCRUNTIME140.dll` is missing, install Microsoft's
+[x64 Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe).
 
 To build from source:
 
@@ -49,7 +51,8 @@ cargo run --locked -p terminal_client
 Profiles and approved host keys are stored in
 `%LOCALAPPDATA%\GPUI Terminal Client\connections.sqlite3`. A profile may remember
 a key file path, but the app does not save private keys, passwords, passphrases,
-or terminal transcripts.
+or terminal transcripts. Only one app instance can use this store at a time so
+forgetting a key revokes all pending attempts that use it.
 
 ## Development checks
 

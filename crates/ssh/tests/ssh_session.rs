@@ -43,6 +43,15 @@ struct Server {
     client_key: PublicKey,
     auth_calls: Arc<AtomicUsize>,
     closed: mpsc::UnboundedSender<()>,
+    behavior: Behavior,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Behavior {
+    #[default]
+    Echo,
+    EarlyOutput,
+    HalfClose,
 }
 
 impl Drop for Server {
@@ -98,6 +107,9 @@ impl server::Handler for Server {
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         if (term, cols, rows, width, height) == ("xterm-256color", 80, 24, 800, 480) {
+            if matches!(self.behavior, Behavior::EarlyOutput) {
+                session.data(channel, &b"early "[..])?;
+            }
             session.channel_success(channel)
         } else {
             session.channel_failure(channel)
@@ -110,7 +122,11 @@ impl server::Handler for Server {
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        session.data(channel, &b"ready"[..])
+        session.data(channel, &b"ready"[..])?;
+        if matches!(self.behavior, Behavior::HalfClose) {
+            session.eof(channel)?;
+        }
+        Ok(())
     }
 
     async fn window_change_request(
@@ -134,11 +150,21 @@ impl server::Handler for Server {
         data: &[u8],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        if matches!(self.behavior, Behavior::HalfClose) {
+            assert_eq!(data, b"after EOF");
+            return session.close(channel);
+        }
         session.data(channel, data.to_vec())
     }
 }
 
 async fn fixture() -> Result<(Fixture, PrivateKey), Box<dyn std::error::Error>> {
+    fixture_with(Behavior::default()).await
+}
+
+async fn fixture_with(
+    behavior: Behavior,
+) -> Result<(Fixture, PrivateKey), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let target = Target::parse(&format!("test@{}", listener.local_addr()?))?;
     let host_key = Arc::new(Mutex::new(PrivateKey::random(
@@ -167,6 +193,7 @@ async fn fixture() -> Result<(Fixture, PrivateKey), Box<dyn std::error::Error>> 
                     client_key: public.clone(),
                     auth_calls: auth_calls.clone(),
                     closed: closed_tx.clone(),
+                    behavior,
                 };
                 tokio::spawn(async move {
                     if let Ok(session) = server::run_stream(config, socket, server).await {
@@ -228,13 +255,45 @@ async fn trust(
 }
 
 async fn password(session: &mut Session) -> TestResult {
+    respond_password(session).await?;
+    connected(session).await
+}
+
+async fn respond_password(session: &mut Session) -> TestResult {
     let Event::Password { reply } = next(session).await? else {
         return Err(io::Error::other("expected password prompt").into());
     };
     reply
         .send(Zeroizing::new("fixture password".into()))
         .map_err(|_| io::Error::other("password prompt was cancelled"))?;
-    connected(session).await
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_preserves_output_sent_before_request_reply() -> TestResult {
+    let (server, _) = fixture_with(Behavior::EarlyOutput).await?;
+    let mut session = server.connect(AuthMethod::Password);
+    trust(&mut session, true).await?;
+    respond_password(&mut session).await?;
+    assert!(matches!(next(&mut session).await?, Event::Connected));
+    assert_eq!(output(&mut session, 11).await?, b"early ready");
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_eof_leaves_client_writes_open_until_close() -> TestResult {
+    let (server, _) = fixture_with(Behavior::HalfClose).await?;
+    let mut session = server.connect(AuthMethod::Password);
+    trust(&mut session, true).await?;
+    password(&mut session).await?;
+    assert!(
+        timeout(Duration::from_millis(100), session.recv())
+            .await
+            .is_err()
+    );
+    session.try_send(Input::Bytes(b"after EOF".to_vec()))?;
+    assert!(matches!(next(&mut session).await?, Event::Ended(Ok(()))));
+    Ok(())
 }
 
 async fn connected(session: &mut Session) -> TestResult {
