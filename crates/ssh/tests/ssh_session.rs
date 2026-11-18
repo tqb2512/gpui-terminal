@@ -880,15 +880,16 @@ async fn sftp_atomic_publish_preserves_remote_mode_and_replaces_file() -> TestRe
     stage.seal(Some(&metadata)).await?;
     stage.publish(PublishMode::AtomicReplace).await?;
 
-    let state = server.file_state()?;
-    assert_eq!(state.contents.len(), 1);
-    assert_eq!(
-        state.contents.get(path.as_str()).map(Vec::as_slice),
-        Some(b"saved".as_slice())
-    );
-    assert_eq!(state.extended_renames, 1);
-    assert_eq!(state.rename_calls, 0);
-    drop(state);
+    {
+        let state = server.file_state()?;
+        assert_eq!(state.contents.len(), 1);
+        assert_eq!(
+            state.contents.get(path.as_str()).map(Vec::as_slice),
+            Some(b"saved".as_slice())
+        );
+        assert_eq!(state.extended_renames, 1);
+        assert_eq!(state.rename_calls, 0);
+    }
     let after = files.metadata(&path).await?;
     assert_eq!(
         (after.mode, after.uid, after.gid),

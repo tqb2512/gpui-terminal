@@ -9,7 +9,8 @@ Build a local-first, Termius-style desktop SSH client in Rust and GPUI. The firs
 | Stage | In scope |
 | --- | --- |
 | **MVP** | Windows; quick connect with `user@host`; saved profiles, search, and recent hosts; embedded SSH; key and password authentication; host-key verification; multiple tabs; resize, Unicode, color, scrollback search, and copy/paste. Installable without an account or a system `ssh` executable. |
-| **After MVP** | SSH agent support, import of common `~/.ssh/config` fields, jump hosts, SFTP with progress and cancellation, saved local port forwarding, and snippets that paste for review before execution. |
+| **SFTP phase one** | Browse remote folders, upload/download individual files, and open local copies with automatic save-back. Minimal Windows Files view. |
+| **After MVP** | SSH agent support, import of common `~/.ssh/config` fields, jump hosts, remote-to-remote transfers, full transfer progress and cancellation, saved local port forwarding, and snippets that paste for review before execution. |
 | **Later** | More desktop OSes, split panes, workspace restore, interactive local shells, and optional encrypted sync. Team vaults and mobile clients are separate product decisions. |
 
 The MVP is **Windows-first and SSH-only**. Start with the recommended Windows x64 target, `x86_64-pc-windows-msvc`; decide the minimum supported Windows version before release. Use GPUI’s Windows backend (Win32 windowing and DirectWrite text).[2] Russh requests a PTY on the remote server, so the app does not need to launch a local ConPTY session or add `portable-pty`.[7]
@@ -60,7 +61,7 @@ terminal-client/
         └── src/hosts.rs
 ```
 
-`terminal_client` wires the workspace and host repository together. `terminal_view` depends on `terminal`, not on SQLite or Russh. `terminal` coordinates the emulator and session lifecycle; `ssh` implements transport without importing GPUI or SQLite. The app wires the SSH trust decisions to the host repository. Keep SFTP and forwarding beside terminal sessions, not inside the emulator; `russh-sftp` is a candidate for the SFTP client.[9]
+`terminal_client` wires the workspace and host repository together. `terminal_view` depends on `terminal`, not on SQLite or Russh. `terminal` coordinates the emulator and session lifecycle; `ssh` implements transport without importing GPUI or SQLite. The app wires the SSH trust decisions to the host repository. SFTP uses `russh-sftp` on a separate channel of the same authenticated SSH connection; streaming, staged remote writes, and local edit tracking do not depend on the Files view.[9]
 
 ### Coding standards
 

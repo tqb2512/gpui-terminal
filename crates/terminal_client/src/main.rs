@@ -1,9 +1,50 @@
 use std::process::ExitCode;
 
 #[cfg(windows)]
+mod files_view;
+#[cfg(windows)]
 mod profile_form;
 #[cfg(windows)]
+mod windows_open_with;
+#[cfg(windows)]
 mod workspace;
+
+#[cfg(all(windows, test))]
+mod files_view_test {
+    use std::{cell::Cell, fs};
+
+    use crate::files_view::{Request, accept_opened};
+    use crate::windows_open_with::OpenWithOutcome;
+
+    #[test]
+    fn files_discards_stale_results() {
+        let first = Request::default();
+        let prepared = first.clone();
+        let replacement = Request::default();
+        first.invalidate();
+        assert!(!prepared.is_current());
+        assert!(replacement.is_current());
+    }
+
+    #[test]
+    fn open_with_cancel_does_not_watch_or_keep_unlaunched_copy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct LocalCopy(tempfile::TempDir);
+        let copy = LocalCopy(tempfile::tempdir()?);
+        let path = copy.0.path().join("edit.txt");
+        fs::write(&path, b"example")?;
+        let called = Cell::new(false);
+        assert!(
+            accept_opened(OpenWithOutcome::Cancelled, copy, |_| {
+                called.set(true);
+            })
+            .is_none()
+        );
+        assert!(!called.get());
+        assert!(!path.exists());
+        Ok(())
+    }
+}
 
 #[cfg(windows)]
 fn main() -> ExitCode {

@@ -13,7 +13,10 @@ use terminal_client::{
 };
 use terminal_view::{TerminalView, ViewEvent, Viewport};
 
-use crate::profile_form::{Field, FieldEdit, auth_method, profile_draft};
+use crate::{
+    files_view::{FilesView, edits_root},
+    profile_form::{Field, FieldEdit, auth_method, profile_draft},
+};
 
 pub(crate) struct Workspace {
     connections: Option<Connections>,
@@ -57,6 +60,8 @@ struct Tab {
     prompt: Option<(PromptId, FormPrompt)>,
     frame: Option<Arc<Snapshot>>,
     viewport: Option<Viewport>,
+    files: Option<Entity<FilesView>>,
+    showing_files: bool,
 }
 
 enum FormPrompt {
@@ -207,6 +212,8 @@ impl Workspace {
                 prompt: None,
                 frame: None,
                 viewport: None,
+                files: None,
+                showing_files: false,
             };
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.attempt.tab == id) {
                 if let Some(field) = tab.prompt.as_ref().and_then(|(_, prompt)| prompt.field()) {
@@ -282,6 +289,9 @@ impl Workspace {
                 }
             }
             ConnectionEventKind::Ended(result) => {
+                if let Some(files) = &tab.files {
+                    files.update(cx, FilesView::disconnect);
+                }
                 if let Some(field) = tab
                     .prompt
                     .take()
@@ -308,6 +318,36 @@ impl Workspace {
         self.confirm = None;
         self.terminal.update(cx, |terminal, _| terminal.reset());
         self.sync_terminal(cx);
+        cx.notify();
+    }
+
+    fn focus_active(&self, window: &mut Window, cx: &App) {
+        let files = self.active.and_then(|id| {
+            let tab = self
+                .tabs
+                .iter()
+                .find(|tab| tab.attempt.tab == id && tab.showing_files)?;
+            tab.files.as_ref()
+        });
+        if let Some(files) = files {
+            files.focus_handle(cx).focus(window);
+        } else {
+            self.terminal.focus_handle(cx).focus(window);
+        }
+    }
+
+    fn show_files(&mut self, id: TabId, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.attempt.tab == id) else {
+            return;
+        };
+        if show && tab.files.is_none() {
+            let Some(connections) = self.connections.clone().filter(|_| tab.connected) else {
+                return;
+            };
+            tab.files = Some(cx.new(|cx| FilesView::new(tab.attempt, connections, cx)));
+        }
+        tab.showing_files = show;
+        self.focus_active(window, cx);
         cx.notify();
     }
 
@@ -532,6 +572,13 @@ impl Workspace {
             return;
         };
         let removed = self.tabs.remove(index);
+        if let Some(files) = &removed.files {
+            if files.read(cx).has_recovery() {
+                self.message = edits_root()
+                    .map(|path| format!("Local edit copies are kept in {}.", path.display()));
+            }
+            files.update(cx, FilesView::disconnect);
+        }
         if let Some(field) = removed
             .prompt
             .as_ref()
@@ -593,11 +640,11 @@ impl Workspace {
         }
     }
 
-    fn button(
-        cx: &Context<Self>,
+    pub(crate) fn button<View: 'static>(
+        cx: &Context<View>,
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
-        clicked: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        clicked: impl Fn(&mut View, &mut Window, &mut Context<View>) + 'static,
     ) -> AnyElement {
         div()
             .id(id)
@@ -955,7 +1002,7 @@ impl Render for Workspace {
                         label,
                         move |view, window, cx| {
                             view.select_tab(id, cx);
-                            window.focus(&view.terminal.focus_handle(cx));
+                            view.focus_active(window, cx);
                         },
                     ))
                     .child(Self::button(
@@ -1009,6 +1056,14 @@ impl Render for Workspace {
         } else if let Some(tab) = active {
             let id = tab.attempt.tab;
             let endpoint = tab.endpoint.clone();
+            let contents = tab
+                .files
+                .as_ref()
+                .filter(|_| tab.showing_files)
+                .map_or_else(
+                    || self.terminal.clone().into_any_element(),
+                    |files| files.clone().into_any_element(),
+                );
             div()
                 .flex_1()
                 .min_h_0()
@@ -1028,6 +1083,20 @@ impl Render for Workspace {
                                 .text_color(rgb(0xb7c1d0))
                                 .child(tab.status.clone()),
                         )
+                        .when(tab.connected || tab.files.is_some(), |row| {
+                            row.child(Self::button(
+                                cx,
+                                "switch-terminal",
+                                "Terminal",
+                                move |view, window, cx| view.show_files(id, false, window, cx),
+                            ))
+                            .child(Self::button(
+                                cx,
+                                "switch-files",
+                                "Files",
+                                move |view, window, cx| view.show_files(id, true, window, cx),
+                            ))
+                        })
                         .when(tab.finished, |row| {
                             row.child(Self::button(
                                 cx,
@@ -1046,7 +1115,7 @@ impl Render for Workspace {
                             ))
                         }),
                 )
-                .child(div().flex_1().min_h_0().child(self.terminal.clone()))
+                .child(div().flex_1().min_h_0().child(contents))
                 .into_any_element()
         } else if !sidebar && window.viewport_size().width < px(540.) && self.hosts_visible {
             div()

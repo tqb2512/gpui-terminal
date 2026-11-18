@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File},
+    future::Future,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     pin::Pin,
@@ -11,7 +12,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use ssh::{PublishMode, RemoteKind, RemoteMetadata, RemotePath, SftpError};
-use tokio::{io::AsyncWrite, runtime::Handle, sync::watch, time::interval};
+use tokio::{io::AsyncWrite, runtime::Handle, sync::watch, time::sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -172,6 +173,10 @@ impl AttemptFiles {
 }
 
 impl PreparedEdit {
+    pub fn is_active(&self) -> bool {
+        !self.files.cancel.is_cancelled()
+    }
+
     pub fn local_path(&self) -> &Path {
         self.copy.path()
     }
@@ -210,37 +215,44 @@ impl ActiveEdit {
         let Self {
             files,
             remote,
-            mut version,
+            version,
             local,
             _slot,
         } = self;
-        let mut clock = interval(Duration::from_secs(1));
-        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        clock.tick().await;
         run_watch(
             runtime,
             &local,
-            version.digest,
+            (version.digest, version),
             (&files.cancel, &stop),
             &status,
-            async || {
-                clock.tick().await;
+            || sleep(Duration::from_secs(1)),
+            |mut version, snapshot| {
+                let files = files.clone();
+                let remote = remote.clone();
+                let stop = stop.clone();
+                async move {
+                    save(&files, &remote, &mut version, snapshot, &stop).await?;
+                    Ok(version)
+                }
             },
-            async |snapshot| save(&files, &remote, &mut version, snapshot, &stop).await,
         )
         .await;
     }
 }
 
-pub(crate) async fn run_watch(
+pub(crate) async fn run_watch<State, Tick, Upload>(
     runtime: &Handle,
     local: &Path,
-    mut saved: ContentDigest,
+    (mut saved, mut state): (ContentDigest, State),
     (disconnect, stop): (&CancellationToken, &CancellationToken),
     status: &watch::Sender<EditStatus>,
-    mut tick: impl AsyncFnMut(),
-    mut upload: impl AsyncFnMut(Snapshot) -> Result<(), EditPause>,
-) {
+    mut tick: impl FnMut() -> Tick,
+    mut upload: impl FnMut(State, Snapshot) -> Upload,
+) where
+    State: Send,
+    Tick: Future<Output = ()> + Send,
+    Upload: Future<Output = Result<State, EditPause>> + Send,
+{
     let mut candidate = None;
     let end = loop {
         tokio::select! {
@@ -280,22 +292,21 @@ pub(crate) async fn run_watch(
             break EditStatus::Paused(EditPause::Local);
         };
         status.send_replace(EditStatus::Saving);
-        if let Err(reason) = upload(Snapshot {
-            digest: sample.digest,
-            file,
-        })
+        state = match upload(
+            state,
+            Snapshot {
+                digest: sample.digest,
+                file,
+            },
+        )
         .await
         {
-            let end = if stop.is_cancelled()
-                && reason == EditPause::Disconnected
-                && !disconnect.is_cancelled()
-            {
-                EditStatus::Finished
-            } else {
-                EditStatus::Paused(reason)
-            };
-            break end;
-        }
+            Ok(state) => state,
+            Err(EditPause::Disconnected) if stop.is_cancelled() && !disconnect.is_cancelled() => {
+                break EditStatus::Finished;
+            }
+            Err(reason) => break EditStatus::Paused(reason),
+        };
         saved = sample.digest;
         candidate = None;
         status.send_replace(EditStatus::Saved);
@@ -468,21 +479,21 @@ fn remote_pause(error: SftpError) -> EditPause {
     }
 }
 
-pub(crate) fn edit_filename(name: &str) -> Result<String, FileError> {
+pub fn valid_windows_filename(name: &str) -> bool {
     if name.is_empty()
         || name.ends_with(['.', ' '])
         || name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
         || name.chars().any(char::is_control)
     {
-        return Err(FileError::EditType);
+        return false;
     }
     let stem = name
         .split('.')
         .next()
-        .ok_or(FileError::EditType)?
+        .unwrap_or_default()
         .trim_end()
         .to_ascii_uppercase();
-    if matches!(
+    !(matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
     ) || ["COM", "LPT"].iter().any(|prefix| {
@@ -492,7 +503,11 @@ pub(crate) fn edit_filename(name: &str) -> Result<String, FileError> {
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
             )
         })
-    }) {
+    }))
+}
+
+pub(crate) fn edit_filename(name: &str) -> Result<String, FileError> {
+    if !valid_windows_filename(name) {
         return Err(FileError::EditType);
     }
     let extension = Path::new(name)

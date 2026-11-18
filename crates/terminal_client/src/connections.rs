@@ -117,6 +117,10 @@ pub struct Connections {
 }
 
 impl Connections {
+    pub fn runtime(&self) -> &Handle {
+        &self.runtime
+    }
+
     pub async fn open(
         runtime: &Handle,
         directory: &Path,

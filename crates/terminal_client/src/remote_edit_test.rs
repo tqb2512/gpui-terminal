@@ -35,27 +35,30 @@ async fn edit_tracks_replace_and_save_during_upload() -> TestResult {
         run_watch(
             &runtime,
             &path,
-            baseline,
+            (baseline, ()),
             (&CancellationToken::new(), &stop),
             &status,
-            async || {
+            || {
                 ticks += 1;
                 if ticks == 7 {
                     stop.cancel();
                 }
+                std::future::ready(())
             },
-            async |mut snapshot| {
-                use std::io::Read as _;
-                let mut bytes = Vec::new();
-                if uploads.is_empty() {
-                    replace(&path, b"c").map_err(|_| EditPause::Local)?;
-                }
-                snapshot
-                    .file
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| EditPause::Local)?;
-                uploads.push(bytes);
-                Ok(())
+            |(), mut snapshot| {
+                std::future::ready((|| {
+                    use std::io::Read as _;
+                    let mut bytes = Vec::new();
+                    if uploads.is_empty() {
+                        replace(&path, b"c").map_err(|_| EditPause::Local)?;
+                    }
+                    snapshot
+                        .file
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| EditPause::Local)?;
+                    uploads.push(bytes);
+                    Ok(())
+                })())
             },
         ),
     )
@@ -181,18 +184,19 @@ async fn edit_stops_on_disconnect_without_replaying() -> TestResult {
         run_watch(
             &runtime,
             &path,
-            baseline,
+            (baseline, ()),
             (&disconnect, &CancellationToken::new()),
             &status,
-            async || {
+            || {
                 ticks += 1;
                 if ticks == 2 {
                     disconnect.cancel();
                 }
+                std::future::ready(())
             },
-            async |_| {
+            |(), _| {
                 uploads += 1;
-                Ok(())
+                std::future::ready(Ok(()))
             },
         ),
     )

@@ -11,7 +11,7 @@ pub use connections::{
     ManagerError, Prompt, PromptId, PromptKind, PromptResponse, TabId,
 };
 pub use file_transfer::{AttemptFiles, FileError};
-pub use remote_edit::{ActiveEdit, EditPause, EditStatus, PreparedEdit};
+pub use remote_edit::{ActiveEdit, EditPause, EditStatus, PreparedEdit, valid_windows_filename};
 
 #[cfg(test)]
 mod connections_test;

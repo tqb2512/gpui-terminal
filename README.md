@@ -54,6 +54,29 @@ a key file path, but the app does not save private keys, passwords, passphrases,
 or terminal transcripts. Only one app instance can use this store at a time so
 forgetting a key revokes all pending attempts that use it.
 
+## Browse and edit remote files
+
+Choose **Files** in a connected SSH tab. Browse from the remote home directory
+and use **Upload…** or select a regular file and choose **Download…**. Transfers
+do not overwrite existing destinations. Select **Terminal** to return to the
+shell without disconnecting.
+
+**Open with…** copies a supported file (up to 32 MiB) to Windows and prompts for
+a local app. Save normally in that app. The Files view reports when the save
+has been uploaded to the original remote file. **Finish editing** stops
+automatic uploads. Closing the tab or losing the connection also stops them;
+reconnect does not replay changes. The local copy remains under
+`%LOCALAPPDATA%\GPUI Terminal Client\edits` and can be recovered or removed
+manually. Remove copies when you no longer want them stored on this PC.
+
+Open with supports common text, config, data, image and document types and
+requires the server's `posix-rename@openssh.com` extension. Download remains
+available on servers without it. If the original has changed, automatic
+save-back pauses rather than overwriting it. SFTP cannot make the conflict
+check and rename a single operation, so avoid automatic save-back on files
+with concurrent writers or files whose ACLs, extended attributes, or hard-link
+identity must be preserved.
+
 ## Development checks
 
 ```powershell
@@ -80,6 +103,12 @@ On a Windows x64 desktop, use an SSH server you control:
    fingerprint.
 5. Check keyboard focus and small/high-DPI window layouts, then close the last
    window and verify the app exits. Repeat with the system SSH client absent.
+6. Use Files on two hosts with terminals still active. Upload and download a
+   regular file, try a destination that already exists, and cancel each native
+   picker. Open a supported file once in Notepad and once in an editor that saves
+   by replacing the file. Save twice, then test a remote conflict and disconnect
+   during an edit; verify that the local copy survives and reconnect does not
+   send it automatically.
 
 See the [project scope and architecture](terminal-client-project.md),
 [architecture diagram](gpui-terminal-architecture.html), and [coding guidelines](AGENTS.md).
