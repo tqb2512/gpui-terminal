@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex,
@@ -12,8 +13,14 @@ use russh::{
     keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
     server::{self, Auth, ChannelOpenHandle, Msg, VerifiedPublicKey},
 };
-use ssh::{AuthMethod, Event, Input, PtySize, Session, Target, connect};
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle, time::timeout};
+use russh_sftp::protocol::{StatusCode, Version};
+use ssh::{AuthMethod, Event, Input, PtySize, Session, SftpError, Target, connect};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+    time::timeout,
+};
 use zeroize::Zeroizing;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -30,6 +37,7 @@ struct Fixture {
     target: Target,
     host_key: Arc<Mutex<PrivateKey>>,
     auth_calls: Arc<AtomicUsize>,
+    sftp_requests: Arc<Semaphore>,
     closed: mpsc::UnboundedReceiver<()>,
 }
 
@@ -44,6 +52,9 @@ struct Server {
     auth_calls: Arc<AtomicUsize>,
     closed: mpsc::UnboundedSender<()>,
     behavior: Behavior,
+    sftp_requests: Arc<Semaphore>,
+    channels: HashMap<ChannelId, Channel<Msg>>,
+    sftp_channels: HashSet<ChannelId>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -52,6 +63,8 @@ enum Behavior {
     Echo,
     EarlyOutput,
     HalfClose,
+    Sftp,
+    StallSftp,
 }
 
 impl Drop for Server {
@@ -87,11 +100,45 @@ impl server::Handler for Server {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        if matches!(self.behavior, Behavior::Sftp) {
+            self.channels.insert(channel.id(), channel);
+        }
         reply.accept().await;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel_id: ChannelId,
+        name: &str,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            self.sftp_requests.add_permits(1);
+            if matches!(self.behavior, Behavior::StallSftp) {
+                return Ok(());
+            }
+            if let Some(channel) = self.channels.remove(&channel_id) {
+                self.sftp_channels.insert(channel_id);
+                session.channel_success(channel_id)?;
+                tokio::spawn(russh_sftp::server::run(channel.into_stream(), Files));
+                return Ok(());
+            }
+        }
+        session.channel_failure(channel_id)
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
+        self.sftp_channels.remove(&channel);
         Ok(())
     }
 
@@ -150,11 +197,37 @@ impl server::Handler for Server {
         data: &[u8],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        if self.sftp_channels.contains(&channel) {
+            return Ok(());
+        }
         if matches!(self.behavior, Behavior::HalfClose) {
             assert_eq!(data, b"after EOF");
             return session.close(channel);
         }
         session.data(channel, data.to_vec())
+    }
+}
+
+struct Files;
+
+impl russh_sftp::server::Handler for Files {
+    type Error = StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        StatusCode::OpUnsupported
+    }
+
+    async fn init(
+        &mut self,
+        version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        assert_eq!(version, 3);
+        let mut response = Version::new();
+        response
+            .extensions
+            .insert("posix-rename@openssh.com".into(), "1".into());
+        Ok(response)
     }
 }
 
@@ -172,12 +245,14 @@ async fn fixture_with(
         Algorithm::Ed25519,
     )?));
     let auth_calls = Arc::new(AtomicUsize::new(0));
+    let sftp_requests = Arc::new(Semaphore::new(0));
     let (closed_tx, closed) = mpsc::unbounded_channel();
     let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let public = client_key.public_key().clone();
     let task = tokio::spawn({
         let host_key = host_key.clone();
         let auth_calls = auth_calls.clone();
+        let sftp_requests = sftp_requests.clone();
         async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let key = match host_key.lock() {
@@ -194,6 +269,9 @@ async fn fixture_with(
                     auth_calls: auth_calls.clone(),
                     closed: closed_tx.clone(),
                     behavior,
+                    sftp_requests: sftp_requests.clone(),
+                    channels: HashMap::new(),
+                    sftp_channels: HashSet::new(),
                 };
                 tokio::spawn(async move {
                     if let Ok(session) = server::run_stream(config, socket, server).await {
@@ -209,6 +287,7 @@ async fn fixture_with(
             target,
             host_key,
             auth_calls,
+            sftp_requests,
             closed,
         },
         client_key,
@@ -312,6 +391,73 @@ async fn output(session: &mut Session, size: usize) -> Result<Vec<u8>, Box<dyn s
         }
     }
     Ok(bytes)
+}
+
+#[tokio::test]
+async fn sftp_opens_once_without_reauthentication() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let mut session = server.connect(AuthMethod::Password);
+    let opener = session.sftp_opener();
+    assert!(matches!(opener.open().await, Err(SftpError::NotConnected)));
+    trust(&mut session, true).await?;
+    password(&mut session).await?;
+
+    let first = timeout(DEADLINE, opener.open()).await??;
+    let second = timeout(DEADLINE, opener.open()).await??;
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(first.supports_atomic_replace());
+    assert_eq!(server.auth_calls.load(SeqCst), 1);
+    assert_eq!(server.sftp_requests.available_permits(), 1);
+    session.try_send(Input::Bytes(b"still live".to_vec()))?;
+    assert_eq!(output(&mut session, 10).await?, b"still live");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_refusal_preserves_shell() -> TestResult {
+    let (server, _) = fixture().await?;
+    let mut session = server.connect(AuthMethod::Password);
+    trust(&mut session, true).await?;
+    password(&mut session).await?;
+
+    let opener = session.sftp_opener();
+    for _ in 0..2 {
+        assert!(matches!(
+            timeout(DEADLINE, opener.open()).await?,
+            Err(SftpError::SubsystemUnavailable)
+        ));
+    }
+    assert_eq!(server.sftp_requests.available_permits(), 2);
+    session.try_send(Input::Bytes(b"still live".to_vec()))?;
+    assert_eq!(output(&mut session, 10).await?, b"still live");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_opener_expires_with_session() -> TestResult {
+    let (mut server, _) = fixture_with(Behavior::StallSftp).await?;
+    let mut session = server.connect(AuthMethod::Password);
+    trust(&mut session, true).await?;
+    password(&mut session).await?;
+
+    let opener = session.sftp_opener();
+    let pending = tokio::spawn({
+        let opener = opener.clone();
+        async move { opener.open().await }
+    });
+    timeout(DEADLINE, server.sftp_requests.acquire())
+        .await??
+        .forget();
+    session.try_send(Input::Bytes(b"still live".to_vec()))?;
+    assert_eq!(output(&mut session, 10).await?, b"still live");
+    session.cancel();
+    assert!(matches!(
+        timeout(DEADLINE, pending).await??,
+        Err(SftpError::Disconnected)
+    ));
+    assert!(matches!(opener.open().await, Err(SftpError::Disconnected)));
+    assert_eq!(timeout(DEADLINE, server.closed.recv()).await?, Some(()));
+    Ok(())
 }
 
 #[tokio::test]

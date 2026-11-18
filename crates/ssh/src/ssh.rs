@@ -1,11 +1,13 @@
 //! SSH transport and host verification.
 
 mod client;
+mod sftp;
 mod target;
 
 pub use client::{
     Event, Input, InputPermit, InputSender, PtySize, SendInputError, Session, SessionError, connect,
 };
+pub use sftp::{SftpClient, SftpError, SftpOpener};
 pub use target::{AuthMethod, Endpoint, Target, TargetError};
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::sftp::{self, SftpOpener, SftpRequests};
 use crate::{AuthMethod, Target};
 
 const CHUNK: usize = 16 * 1024;
@@ -114,9 +115,14 @@ pub struct Session {
     events: mpsc::Receiver<Event>,
     input: mpsc::Sender<Input>,
     cancel: CancellationToken,
+    sftp: SftpOpener,
 }
 
 impl Session {
+    pub fn sftp_opener(&self) -> SftpOpener {
+        self.sftp.clone()
+    }
+
     pub fn split_input(&self) -> InputSender {
         InputSender {
             input: self.input.clone(),
@@ -184,13 +190,18 @@ pub fn connect(runtime: &Handle, target: Target, auth: AuthMethod, size: PtySize
     let (event_sender, events) = mpsc::channel(32);
     let (input, commands) = mpsc::channel(32);
     let cancel = CancellationToken::new();
+    let sftp_cancel = cancel.child_token();
+    let (sftp, sftp_requests) = sftp::requests(sftp_cancel.clone());
     runtime.spawn({
         let cancel = cancel.clone();
         async move {
-            let result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                result = run(target, auth, size, commands, &event_sender, &cancel) => result,
+            let result = {
+                let _sftp_lifetime = sftp_cancel.drop_guard();
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    result = run(target, auth, size, commands, &event_sender, &cancel, sftp_requests) => result,
+                }
             };
             tokio::select! {
                 () = cancel.cancelled() => {}
@@ -202,6 +213,7 @@ pub fn connect(runtime: &Handle, target: Target, auth: AuthMethod, size: PtySize
         events,
         input,
         cancel,
+        sftp,
     }
 }
 
@@ -259,6 +271,7 @@ async fn run(
     mut commands: mpsc::Receiver<Input>,
     events: &mpsc::Sender<Event>,
     cancel: &CancellationToken,
+    sftp_requests: SftpRequests,
 ) -> Result<(), SessionError> {
     let endpoint = target.endpoint();
     let mut socket = timeout(
@@ -357,15 +370,17 @@ async fn run(
     expect_success(&mut channel, &mut early_output).await?;
     channel.request_shell(true).await?;
     expect_success(&mut channel, &mut early_output).await?;
+    sftp_requests.set_ready();
     events
         .send(Event::Connected)
         .await
         .map_err(|_| SessionError::Cancelled)?;
-    forward_output(events, &early_output).await?;
-    drop(early_output);
     let (mut reader, writer) = channel.split();
     tokio::select! {
+        () = sftp_requests.serve(&connection) => Err(SessionError::Cancelled),
         result = async {
+            forward_output(events, &early_output).await?;
+            drop(early_output);
             while let Some(message) = reader.wait().await {
                 match message {
                     ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {

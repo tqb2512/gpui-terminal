@@ -10,6 +10,7 @@ path = "src/ssh.rs"
 
 [dependencies]
 russh.workspace = true
+russh-sftp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
