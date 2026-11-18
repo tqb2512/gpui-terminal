@@ -10,6 +10,7 @@ path = "src/terminal_view.rs"
 
 [target.'cfg(windows)'.dependencies]
 gpui.workspace = true
+terminal.workspace = true
 
 [lints]
 workspace = true

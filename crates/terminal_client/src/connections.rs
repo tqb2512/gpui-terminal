@@ -68,6 +68,7 @@ pub struct ConnectionEvent {
 }
 
 pub enum ConnectionEventKind {
+    Starting { label: String, endpoint: Endpoint },
     Prompt(Prompt),
     Connected { recent_error: Option<StoreError> },
     Redraw,
@@ -229,6 +230,10 @@ impl Connections {
         self.frame(tab)?.read()
     }
 
+    pub fn current_attempt(&self, tab: TabId) -> Option<AttemptId> {
+        Some(self.frame(tab)?.attempt)
+    }
+
     pub fn selected_text(&self, tab: TabId) -> Option<String> {
         self.frame(tab)?
             .latest
@@ -244,6 +249,18 @@ impl Connections {
         let events = self.events.clone();
         let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
+            let started = ConnectionEvent {
+                attempt: launch.id,
+                kind: ConnectionEventKind::Starting {
+                    label: launch.spec.label.clone(),
+                    endpoint: launch.spec.target.endpoint().clone(),
+                },
+            };
+            tokio::select! {
+                biased;
+                () = launch.cancel.cancelled() => return,
+                result = events.send(started) => if result.is_err() { return; },
+            }
             let mut session = ssh::connect(
                 &runtime, launch.spec.target, launch.spec.auth,
                 PtySize { columns: 80, rows: 24, pixel_width: 0, pixel_height: 0 },
@@ -426,6 +443,7 @@ impl Core {
         let cancel = CancellationToken::new();
         let (sender, input) = mpsc::channel(16);
         let frame = Arc::new(TabFrame {
+            attempt,
             latest: Mutex::new(None),
             redraw_pending: AtomicBool::new(false),
             connected: AtomicBool::new(false),
@@ -644,6 +662,7 @@ impl Drop for Tab {
 type Frames = Arc<Mutex<HashMap<TabId, Arc<TabFrame>>>>;
 
 pub(crate) struct TabFrame {
+    attempt: AttemptId,
     latest: Mutex<Option<Arc<Snapshot>>>,
     redraw_pending: AtomicBool,
     connected: AtomicBool,

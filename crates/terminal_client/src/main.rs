@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
 #[cfg(windows)]
+mod profile_form;
+#[cfg(windows)]
 mod workspace;
 
 #[cfg(windows)]
@@ -11,10 +13,22 @@ fn main() -> ExitCode {
     use std::{cell::Cell, rc::Rc};
     use workspace::Workspace;
 
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Could not start the SSH runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let handle = runtime.handle().clone();
     let exit_code = Rc::new(Cell::new(ExitCode::SUCCESS));
     Application::new().run({
         let exit_code = exit_code.clone();
         move |cx| {
+            terminal_view::bind_keys(cx);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -43,7 +57,7 @@ fn main() -> ExitCode {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| Workspace),
+                |_, cx| cx.new(|cx| Workspace::new(handle, cx)),
             );
             if let Err(error) = window {
                 eprintln!("Could not open the terminal window: {error:#}");

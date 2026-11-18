@@ -72,7 +72,7 @@ pub struct Selection {
     pub end: (u16, u16),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeyStroke {
     pub key: String,
     pub text: Option<String>,
@@ -81,6 +81,7 @@ pub struct KeyStroke {
     pub shift: bool,
 }
 
+#[derive(Clone)]
 pub enum TerminalInput {
     Key(KeyStroke),
     Paste(String),

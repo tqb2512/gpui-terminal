@@ -27,6 +27,7 @@ tempfile.workspace = true
 [target.'cfg(windows)'.dependencies]
 gpui.workspace = true
 terminal_view.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true
