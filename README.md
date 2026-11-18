@@ -17,6 +17,7 @@ cargo run --locked -p terminal_client
 
 Check that a **GPUI Terminal Client** window opens, **No active session** stays
 visible while resizing, and closing the window returns control to the prompt.
+On a small, high-DPI display, check that the title bar is visible at launch.
 
 ## Development checks
 
