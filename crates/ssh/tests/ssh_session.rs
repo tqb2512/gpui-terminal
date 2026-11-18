@@ -13,8 +13,14 @@ use russh::{
     keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
     server::{self, Auth, ChannelOpenHandle, Msg, VerifiedPublicKey},
 };
-use russh_sftp::protocol::{StatusCode, Version};
-use ssh::{AuthMethod, Event, Input, PtySize, Session, SftpError, Target, connect};
+use russh_sftp::protocol::{
+    Attrs, Data, File, FileAttributes, Handle as FileHandle, Name, OpenFlags, Status, StatusCode,
+    Version,
+};
+use ssh::{
+    AuthMethod, Event, Input, PtySize, PublishMode, RemoteKind, RemotePath, Session, SftpClient,
+    SftpError, Target, connect,
+};
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, mpsc},
@@ -38,7 +44,16 @@ struct Fixture {
     host_key: Arc<Mutex<PrivateKey>>,
     auth_calls: Arc<AtomicUsize>,
     sftp_requests: Arc<Semaphore>,
+    files: Arc<Mutex<FixtureFiles>>,
     closed: mpsc::UnboundedReceiver<()>,
+}
+
+impl Fixture {
+    fn file_state(&self) -> io::Result<std::sync::MutexGuard<'_, FixtureFiles>> {
+        self.files
+            .lock()
+            .map_err(|_| io::Error::other("fixture lock poisoned"))
+    }
 }
 
 impl Drop for Fixture {
@@ -55,6 +70,7 @@ struct Server {
     sftp_requests: Arc<Semaphore>,
     channels: HashMap<ChannelId, Channel<Msg>>,
     sftp_channels: HashSet<ChannelId>,
+    files: Arc<Mutex<FixtureFiles>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -125,7 +141,13 @@ impl server::Handler for Server {
             if let Some(channel) = self.channels.remove(&channel_id) {
                 self.sftp_channels.insert(channel_id);
                 session.channel_success(channel_id)?;
-                tokio::spawn(russh_sftp::server::run(channel.into_stream(), Files));
+                tokio::spawn(russh_sftp::server::run(
+                    channel.into_stream(),
+                    Files {
+                        state: self.files.clone(),
+                        listed: 0,
+                    },
+                ));
                 return Ok(());
             }
         }
@@ -208,7 +230,39 @@ impl server::Handler for Server {
     }
 }
 
-struct Files;
+#[derive(Default)]
+struct FixtureFiles {
+    contents: HashMap<String, Vec<u8>>,
+    entry_count: usize,
+    stall_rename: bool,
+    rename_calls: usize,
+}
+
+struct Files {
+    state: Arc<Mutex<FixtureFiles>>,
+    listed: usize,
+}
+
+fn attributes(mode: u32, size: u64) -> FileAttributes {
+    FileAttributes {
+        permissions: Some(mode),
+        size: Some(size),
+        uid: Some(1000),
+        gid: Some(1000),
+        atime: Some(1),
+        mtime: Some(1),
+        ..Default::default()
+    }
+}
+
+fn ok_status(id: u32) -> Status {
+    Status {
+        id,
+        status_code: StatusCode::Ok,
+        error_message: String::new(),
+        language_tag: String::new(),
+    }
+}
 
 impl russh_sftp::server::Handler for Files {
     type Error = StatusCode;
@@ -229,6 +283,153 @@ impl russh_sftp::server::Handler for Files {
             .insert("posix-rename@openssh.com".into(), "1".into());
         Ok(response)
     }
+
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        assert_eq!(path, ".");
+        Ok(Name {
+            id,
+            files: vec![File::new("/home/test", FileAttributes::default())],
+        })
+    }
+
+    async fn opendir(&mut self, id: u32, path: String) -> Result<FileHandle, Self::Error> {
+        assert_eq!(path, "/home/test");
+        self.listed = 0;
+        Ok(FileHandle { id, handle: path })
+    }
+
+    async fn readdir(&mut self, id: u32, _handle: String) -> Result<Name, Self::Error> {
+        let state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        let end = (self.listed + 100).min(state.entry_count);
+        if self.listed >= end {
+            return Err(StatusCode::Eof);
+        }
+        let files = (self.listed..end)
+            .map(|index| File::new(format!("file-{index}"), attributes(0o100644, 0)))
+            .collect();
+        self.listed = end;
+        Ok(Name { id, files })
+    }
+
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let attrs = match path.as_str() {
+            "/home/test" => attributes(0o040755, 0),
+            "/home/test/link" => attributes(0o120777, 0),
+            "/home/test/special" => attributes(0o010644, 0),
+            _ => {
+                let state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+                let bytes = state.contents.get(&path).ok_or(StatusCode::NoSuchFile)?;
+                attributes(0o100644, bytes.len() as u64)
+            }
+        };
+        Ok(Attrs { id, attrs })
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        self.lstat(id, handle).await
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        flags: OpenFlags,
+        attrs: FileAttributes,
+    ) -> Result<FileHandle, Self::Error> {
+        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        if flags.bits() == (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE).bits() {
+            assert_eq!(attrs.permissions, Some(0o600));
+            if state.contents.contains_key(&filename) {
+                return Err(StatusCode::Failure);
+            }
+            state.contents.insert(filename.clone(), Vec::new());
+        } else if flags.bits() != OpenFlags::READ.bits() || !state.contents.contains_key(&filename)
+        {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(FileHandle {
+            id,
+            handle: filename,
+        })
+    }
+
+    async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+        Ok(ok_status(id))
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        assert!(len <= 16 * 1024);
+        let state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        let bytes = state.contents.get(&handle).ok_or(StatusCode::NoSuchFile)?;
+        let offset = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+        if offset >= bytes.len() {
+            return Err(StatusCode::Eof);
+        }
+        let data = bytes
+            .get(offset..(offset + len as usize).min(bytes.len()))
+            .ok_or(StatusCode::Failure)?
+            .to_vec();
+        Ok(Data { id, data })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        assert!(data.len() <= 16 * 1024);
+        let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+        let bytes = state
+            .contents
+            .get_mut(&handle)
+            .ok_or(StatusCode::NoSuchFile)?;
+        assert_eq!(offset, bytes.len() as u64);
+        bytes.extend(data);
+        Ok(ok_status(id))
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        self.state
+            .lock()
+            .map_err(|_| StatusCode::Failure)?
+            .contents
+            .remove(&filename)
+            .ok_or(StatusCode::NoSuchFile)?;
+        Ok(ok_status(id))
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        let stall = {
+            let mut state = self.state.lock().map_err(|_| StatusCode::Failure)?;
+            state.rename_calls += 1;
+            if state.contents.contains_key(&newpath) {
+                return Err(StatusCode::Failure);
+            }
+            let file = state
+                .contents
+                .remove(&oldpath)
+                .ok_or(StatusCode::NoSuchFile)?;
+            state.contents.insert(newpath, file);
+            state.stall_rename
+        };
+        if stall {
+            return std::future::pending().await;
+        }
+        Ok(ok_status(id))
+    }
 }
 
 async fn fixture() -> Result<(Fixture, PrivateKey), Box<dyn std::error::Error>> {
@@ -246,6 +447,7 @@ async fn fixture_with(
     )?));
     let auth_calls = Arc::new(AtomicUsize::new(0));
     let sftp_requests = Arc::new(Semaphore::new(0));
+    let files = Arc::new(Mutex::new(FixtureFiles::default()));
     let (closed_tx, closed) = mpsc::unbounded_channel();
     let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let public = client_key.public_key().clone();
@@ -253,6 +455,7 @@ async fn fixture_with(
         let host_key = host_key.clone();
         let auth_calls = auth_calls.clone();
         let sftp_requests = sftp_requests.clone();
+        let files = files.clone();
         async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let key = match host_key.lock() {
@@ -272,6 +475,7 @@ async fn fixture_with(
                     sftp_requests: sftp_requests.clone(),
                     channels: HashMap::new(),
                     sftp_channels: HashSet::new(),
+                    files: files.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(session) = server::run_stream(config, socket, server).await {
@@ -288,6 +492,7 @@ async fn fixture_with(
             host_key,
             auth_calls,
             sftp_requests,
+            files,
             closed,
         },
         client_key,
@@ -457,6 +662,134 @@ async fn sftp_opener_expires_with_session() -> TestResult {
     ));
     assert!(matches!(opener.open().await, Err(SftpError::Disconnected)));
     assert_eq!(timeout(DEADLINE, server.closed.recv()).await?, Some(()));
+    Ok(())
+}
+
+async fn connected_files(
+    server: &Fixture,
+) -> Result<(Session, Arc<SftpClient>), Box<dyn std::error::Error>> {
+    let mut session = server.connect(AuthMethod::Password);
+    trust(&mut session, true).await?;
+    password(&mut session).await?;
+    let files = timeout(DEADLINE, session.sftp_opener().open()).await??;
+    Ok((session, files))
+}
+
+#[test]
+fn remote_paths_do_not_reinterpret_invalid_children() -> TestResult {
+    assert_eq!(RemotePath::absolute("/")?.parent(), None);
+    let home = RemotePath::absolute("/home/ops")?;
+    assert_eq!(home.child("résumé.txt")?.as_str(), "/home/ops/résumé.txt");
+    for invalid in ["", ".", "..", "a/b", "a\\b", "\nname"] {
+        assert!(matches!(home.child(invalid), Err(SftpError::InvalidPath)));
+    }
+    assert!(matches!(
+        RemotePath::absolute("/a//b"),
+        Err(SftpError::InvalidPath)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_remote_listing_is_bounded() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let home = files.home().await?;
+    assert_eq!(home.as_str(), "/home/test");
+    server.file_state()?.entry_count = 10_001;
+    assert!(matches!(
+        timeout(DEADLINE, files.list(&home)).await?,
+        Err(SftpError::DirectoryTooLarge)
+    ));
+    server.file_state()?.entry_count = 10_000;
+    assert_eq!(timeout(DEADLINE, files.list(&home)).await??.len(), 10_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_create_only_keeps_late_destination() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let path = files.home().await?.child("report.txt")?;
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(b"new").await?;
+    stage.seal(None).await?;
+    server
+        .file_state()?
+        .contents
+        .insert(path.as_str().into(), b"old".to_vec());
+    assert!(matches!(
+        stage.publish(PublishMode::CreateOnly).await,
+        Err(SftpError::AlreadyExists)
+    ));
+    stage.abort().await?;
+    let state = server.file_state()?;
+    assert_eq!(state.contents.len(), 1);
+    assert_eq!(
+        state.contents.get(path.as_str()).map(Vec::as_slice),
+        Some(b"old".as_slice())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_publish_timeout_is_unknown() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let path = files.home().await?.child("report.txt")?;
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(b"new").await?;
+    stage.seal(None).await?;
+    server.file_state()?.stall_rename = true;
+    for _ in 0..2 {
+        assert!(matches!(
+            timeout(DEADLINE, stage.publish(PublishMode::CreateOnly)).await?,
+            Err(SftpError::OutcomeUnknown)
+        ));
+    }
+    let state = server.file_state()?;
+    assert_eq!(state.rename_calls, 1);
+    assert_eq!(
+        state.contents.get(path.as_str()).map(Vec::as_slice),
+        Some(b"new".as_slice())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sftp_streams_regular_files_without_following_special_entries() -> TestResult {
+    let (server, _) = fixture_with(Behavior::Sftp).await?;
+    let (_session, files) = connected_files(&server).await?;
+    let home = files.home().await?;
+    for (name, kind) in [
+        ("link", RemoteKind::Symlink),
+        ("special", RemoteKind::Other),
+    ] {
+        let path = home.child(name)?;
+        assert_eq!(files.metadata(&path).await?.kind, kind);
+        assert!(matches!(
+            files.open_read(&path).await,
+            Err(SftpError::NotRegularFile)
+        ));
+    }
+    let path = home.child("regular")?;
+    let expected = vec![42; 32 * 1024 + 9];
+    let mut stage = files.stage_write(&path).await?;
+    stage.write_all(&expected).await?;
+    stage.seal(None).await?;
+    stage.publish(PublishMode::CreateOnly).await?;
+    let mut reader = files.open_read(&path).await?;
+    let mut actual = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let size = reader.read(&mut buffer).await?;
+        if size == 0 {
+            break;
+        }
+        actual.extend_from_slice(&buffer[..size]);
+    }
+    reader.close().await?;
+    assert_eq!(actual, expected);
     Ok(())
 }
 

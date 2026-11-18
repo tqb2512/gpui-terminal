@@ -7,7 +7,10 @@ mod target;
 pub use client::{
     Event, Input, InputPermit, InputSender, PtySize, SendInputError, Session, SessionError, connect,
 };
-pub use sftp::{SftpClient, SftpError, SftpOpener};
+pub use sftp::{
+    PublishMode, RemoteEntry, RemoteKind, RemoteMetadata, RemotePath, RemoteReader, SftpClient,
+    SftpError, SftpOpener, StagedRemoteWrite,
+};
 pub use target::{AuthMethod, Endpoint, Target, TargetError};
 
 #[cfg(test)]
