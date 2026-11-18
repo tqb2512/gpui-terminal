@@ -8,5 +8,8 @@ publish.workspace = true
 [lib]
 path = "src/ssh.rs"
 
+[dependencies]
+thiserror.workspace = true
+
 [lints]
 workspace = true

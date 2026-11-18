@@ -8,5 +8,13 @@ publish.workspace = true
 [lib]
 path = "src/hosts.rs"
 
+[dependencies]
+rusqlite.workspace = true
+ssh.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

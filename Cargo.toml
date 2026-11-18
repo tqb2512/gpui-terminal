@@ -10,7 +10,11 @@ publish = false
 
 [workspace.dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+ssh = { path = "crates/ssh" }
+tempfile = "3"
 terminal_view = { path = "crates/terminal_view" }
+thiserror = "2"
 
 [workspace.lints.clippy]
 expect_used = "warn"
