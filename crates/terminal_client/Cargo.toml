@@ -9,6 +9,20 @@ publish.workspace = true
 name = "terminal_client"
 path = "src/main.rs"
 
+[lib]
+path = "src/terminal_client.rs"
+
+[dependencies]
+hosts.workspace = true
+ssh.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 gpui.workspace = true
 terminal_view.workspace = true

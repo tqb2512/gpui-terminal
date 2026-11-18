@@ -5613,7 +5613,14 @@ name = "terminal_client"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "hosts",
+ "ssh",
+ "tempfile",
  "terminal_view",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "zeroize",
 ]
 
 [[package]]
