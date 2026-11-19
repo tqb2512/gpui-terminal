@@ -1,9 +1,9 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, Render, ScrollHandle, SharedString, Stateful, Subscription, Task,
-    Window, div, prelude::*, px, rgb,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, IntoElement, KeyDownEvent, Pixels, Render, ScrollHandle, SharedString, Stateful,
+    Subscription, Task, Window, div, prelude::*, px, rgb,
 };
 use hosts::{Profile, ProfileId};
 use ssh::{AuthMethod, Endpoint, Target};
@@ -24,7 +24,7 @@ const CHROME: u32 = 0x20252d;
 pub(crate) const SURFACE: u32 = 0x222831;
 pub(crate) const RULE: u32 = 0x39434f;
 pub(crate) const MUTED: u32 = 0xb7c1d0;
-const FOCUS: u32 = 0x9dbefa;
+pub(crate) const FOCUS: u32 = 0x9dbefa;
 
 pub(crate) struct Workspace {
     connections: Option<Connections>,
@@ -33,6 +33,7 @@ pub(crate) struct Workspace {
     editor: Option<Editor>,
     tabs: Vec<Tab>,
     tab_scroll: ScrollHandle,
+    focused_tab: Option<TabId>,
     active: Option<TabId>,
     terminal: Entity<TerminalView>,
     confirm: Option<Confirm>,
@@ -63,6 +64,7 @@ struct Editor {
 
 struct Tab {
     attempt: AttemptId,
+    focus: FocusHandle,
     label: String,
     endpoint: Endpoint,
     status: String,
@@ -173,6 +175,7 @@ impl Workspace {
             editor: None,
             tabs: Vec::new(),
             tab_scroll: ScrollHandle::new(),
+            focused_tab: None,
             active: None,
             terminal,
             confirm: None,
@@ -232,8 +235,12 @@ impl Workspace {
             return;
         }
         if let ConnectionEventKind::Starting { label, endpoint } = event.kind {
+            let existing = self.tabs.iter_mut().find(|tab| tab.attempt.tab == id);
             let state = Tab {
                 attempt: event.attempt,
+                focus: existing
+                    .as_ref()
+                    .map_or_else(|| cx.focus_handle(), |tab| tab.focus.clone()),
                 label,
                 endpoint,
                 status: "Connecting…".into(),
@@ -245,7 +252,7 @@ impl Workspace {
                 files: None,
                 showing_files: false,
             };
-            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.attempt.tab == id) {
+            if let Some(tab) = existing {
                 if let Some(field) = tab.prompt.as_ref().and_then(|(_, prompt)| prompt.field()) {
                     field.update(cx, Field::clear);
                 }
@@ -381,8 +388,6 @@ impl Workspace {
             if let Some(field) = prompt.field() {
                 field.focus_handle(cx).focus(window);
             }
-        } else if let Some(files) = tab.files.as_ref().filter(|_| tab.showing_files) {
-            files.focus_handle(cx).focus(window);
         } else {
             self.terminal.focus_handle(cx).focus(window);
         }
@@ -407,7 +412,11 @@ impl Workspace {
             }));
         }
         tab.showing_files = show;
-        self.focus_active(window, cx);
+        if let Some(files) = tab.files.as_ref().filter(|_| show) {
+            files.focus_handle(cx).focus(window);
+        } else {
+            self.terminal.focus_handle(cx).focus(window);
+        }
         cx.notify();
     }
 
@@ -442,7 +451,11 @@ impl Workspace {
 
     fn on_terminal(&mut self, event: &ViewEvent, cx: &mut Context<Self>) {
         match event {
-            ViewEvent::Resize(viewport) => self.resize(*viewport),
+            ViewEvent::Resize(viewport) => {
+                if self.terminal.read(cx).viewport() == Some(*viewport) {
+                    self.resize(*viewport);
+                }
+            }
             ViewEvent::Input(input) => {
                 if let (Some(id), Some(manager)) = (self.active, &self.connections)
                     && self
@@ -891,7 +904,19 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn tab_bar(&mut self, window: &Window, cx: &Context<Self>) -> Div {
+        let focused = self
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| tab.focus.contains_focused(window, cx));
+        let focused_id = focused.map(|(_, tab)| tab.attempt.tab);
+        if focused_id != self.focused_tab {
+            self.focused_tab = focused_id;
+            if let Some((index, _)) = focused {
+                self.tab_scroll.scroll_to_item(index);
+            }
+        }
         let hosts = Self::button(cx, "hosts-tab", "Hosts", |view, window, cx| {
             view.select_hosts(cx);
             view.focus_active(window, cx);
@@ -933,6 +958,7 @@ impl Workspace {
                 .when(self.active == Some(id), Self::primary);
                 div()
                     .id(SharedString::from(format!("{id:?}")))
+                    .track_focus(&tab.focus)
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -1132,7 +1158,8 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_bar = self.tab_bar(window, cx);
         let active = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.attempt.tab == id));
@@ -1158,14 +1185,13 @@ impl Render for Workspace {
         } else if let Some(tab) = active {
             let id = tab.attempt.tab;
             let endpoint = tab.endpoint.clone();
-            let contents = tab
-                .files
-                .as_ref()
-                .filter(|_| tab.showing_files)
-                .map_or_else(
-                    || self.terminal.clone().into_any_element(),
-                    |files| files.clone().into_any_element(),
-                );
+            let files = tab.files.as_ref().filter(|_| tab.showing_files);
+            let files_label = if files.is_some() {
+                "Hide Files"
+            } else {
+                "Files"
+            };
+            let show_files = files.is_none();
             div()
                 .flex_1()
                 .min_h_0()
@@ -1176,48 +1202,105 @@ impl Render for Workspace {
                         .flex()
                         .flex_wrap()
                         .items_center()
+                        .justify_between()
                         .gap_2()
-                        .p_1()
-                        .bg(rgb(0x20252d))
+                        .px_3()
+                        .py_2()
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(rgb(0xb7c1d0))
-                                .child(tab.status.clone()),
+                                .flex_1()
+                                .flex_basis(px(160.))
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(tab.label.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if tab.connected {
+                                            0xa9c8aa
+                                        } else {
+                                            MUTED
+                                        }))
+                                        .child(tab.status.clone()),
+                                ),
                         )
-                        .when(tab.connected || tab.files.is_some(), |row| {
-                            row.child(Self::button(
-                                cx,
-                                "switch-terminal",
-                                "Terminal",
-                                move |view, window, cx| view.show_files(id, false, window, cx),
-                            ))
-                            .child(Self::button(
-                                cx,
-                                "switch-files",
-                                "Files",
-                                move |view, window, cx| view.show_files(id, true, window, cx),
-                            ))
-                        })
-                        .when(tab.finished, |row| {
-                            row.child(Self::button(
-                                cx,
-                                "reconnect",
-                                "Reconnect",
-                                move |view, _, cx| view.reconnect(id, cx),
-                            ))
-                            .child(Self::button(
-                                cx,
-                                "forget-key",
-                                "Forget host key…",
-                                move |view, _, cx| {
-                                    view.confirm = Some(Confirm::Forget(endpoint.clone()));
-                                    cx.notify();
-                                },
-                            ))
-                        }),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when(tab.connected || tab.files.is_some(), |actions| {
+                                    actions.child(
+                                        Self::button(
+                                            cx,
+                                            "toggle-files",
+                                            files_label,
+                                            move |view, window, cx| {
+                                                view.show_files(id, show_files, window, cx)
+                                            },
+                                        )
+                                        .when(!show_files, Self::primary),
+                                    )
+                                })
+                                .when(tab.finished, |actions| {
+                                    actions
+                                        .child(Self::button(
+                                            cx,
+                                            "reconnect",
+                                            "Reconnect",
+                                            move |view, _, cx| view.reconnect(id, cx),
+                                        ))
+                                        .child(Self::button(
+                                            cx,
+                                            "forget-key",
+                                            "Forget host key…",
+                                            move |view, _, cx| {
+                                                view.confirm =
+                                                    Some(Confirm::Forget(endpoint.clone()));
+                                                cx.notify();
+                                            },
+                                        ))
+                                }),
+                        ),
                 )
-                .child(div().flex_1().min_h_0().child(contents))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .gap_2()
+                        .px_3()
+                        .pb_3()
+                        .when_some(files.cloned(), |row, files| {
+                            row.child(
+                                div()
+                                    .w(files_pane_width(window.viewport_size().width))
+                                    .flex_shrink_0()
+                                    .min_h_0()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(RULE))
+                                    .bg(rgb(SURFACE))
+                                    .overflow_hidden()
+                                    .child(files),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(RULE))
+                                .overflow_hidden()
+                                .child(self.terminal.clone()),
+                        ),
+                )
                 .into_any_element()
         } else {
             self.hosts_screen(cx)
@@ -1240,7 +1323,7 @@ impl Render for Workspace {
                     cx.stop_propagation();
                 }
             })
-            .child(self.tab_bar(cx))
+            .child(tab_bar)
             .when_some(self.message.clone(), |root, message| {
                 root.child(div().px_2().py_1().bg(rgb(0x303744)).child(message))
             })
@@ -1273,6 +1356,10 @@ fn neighbor_after_close(remaining: usize, closed_index: usize) -> Option<usize> 
     remaining.checked_sub(1).map(|last| closed_index.min(last))
 }
 
+fn files_pane_width(window_width: Pixels) -> Pixels {
+    (window_width * 0.45).min(px(272.))
+}
+
 fn take_matching<I: PartialEq, T>(slot: &mut Option<(I, T)>, id: I) -> Option<T> {
     if slot.as_ref().is_some_and(|(candidate, _)| *candidate == id) {
         slot.take().map(|(_, value)| value)
@@ -1291,6 +1378,13 @@ mod tests {
         assert_eq!(neighbor_after_close(2, 1), Some(1));
         assert_eq!(neighbor_after_close(2, 2), Some(1));
         assert_eq!(neighbor_after_close(0, 0), None);
+    }
+
+    #[test]
+    fn files_pane_leaves_room_for_the_shell() {
+        assert_eq!(files_pane_width(px(320.)), px(144.));
+        assert_eq!(files_pane_width(px(600.)), px(270.));
+        assert_eq!(files_pane_width(px(800.)), px(272.));
     }
 
     #[test]

@@ -39,7 +39,7 @@
 
 ### Task 2: Inset Files pane next to a live shell
 
-**Files:** Modify and test `crates/terminal_client/src/workspace.rs`; modify `crates/terminal_client/src/files_view.rs` and `README.md`.
+**Files:** Modify and test `crates/terminal_client/src/workspace.rs`; modify `crates/terminal_client/src/files_view.rs`, `crates/terminal_view/src/terminal_view.rs`, and `README.md`. Clearing cached terminal geometry on tab switches avoids sending the previously shown tab's dimensions.
 
 **Interfaces:** Keep `Workspace::show_files(&mut self, id: TabId, show: bool, window: &mut Window, cx: &mut Context<Self>)` and `FilesView::new` unchanged. Add `files_pane_width(window_width: gpui::Pixels) -> gpui::Pixels`.
 
