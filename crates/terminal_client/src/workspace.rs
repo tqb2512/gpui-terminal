@@ -1,8 +1,9 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, Entity, Focusable, IntoElement, KeyDownEvent,
-    Render, SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, Focusable, FontWeight,
+    IntoElement, KeyDownEvent, Render, ScrollHandle, SharedString, Stateful, Subscription, Task,
+    Window, div, prelude::*, px, rgb,
 };
 use hosts::{Profile, ProfileId};
 use ssh::{AuthMethod, Endpoint, Target};
@@ -18,19 +19,26 @@ use crate::{
     profile_form::{Field, FieldEdit, auth_method, profile_draft},
 };
 
+const WORKSPACE: u32 = 0x181b20;
+const CHROME: u32 = 0x20252d;
+pub(crate) const SURFACE: u32 = 0x222831;
+pub(crate) const RULE: u32 = 0x39434f;
+pub(crate) const MUTED: u32 = 0xb7c1d0;
+const FOCUS: u32 = 0x9dbefa;
+
 pub(crate) struct Workspace {
     connections: Option<Connections>,
     profiles: Vec<Profile>,
     search: Entity<Field>,
     editor: Option<Editor>,
     tabs: Vec<Tab>,
+    tab_scroll: ScrollHandle,
     active: Option<TabId>,
     terminal: Entity<TerminalView>,
     confirm: Option<Confirm>,
     message: Option<String>,
     file_warning: Option<String>,
     file_warnings: tokio::sync::mpsc::Sender<String>,
-    hosts_visible: bool,
     pending: HashMap<u64, Task<()>>,
     serial: u64,
     _startup: Task<()>,
@@ -95,7 +103,7 @@ enum Confirm {
 }
 
 impl Workspace {
-    pub fn new(runtime: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
+    pub fn new(runtime: tokio::runtime::Handle, window: &Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| Field::new("Search saved hosts", "", false, cx));
         let terminal = cx.new(TerminalView::new);
         let (file_warnings, mut warnings) = tokio::sync::mpsc::channel(16);
@@ -118,7 +126,7 @@ impl Workspace {
                 view.on_terminal(event, cx)
             }),
         ];
-        let startup = cx.spawn(async move |weak, cx| {
+        let startup = cx.spawn_in(window, async move |weak, cx| {
             let result = match std::env::var_os("LOCALAPPDATA") {
                 Some(path) => {
                     Connections::open(&runtime, &PathBuf::from(path).join("GPUI Terminal Client"))
@@ -141,7 +149,9 @@ impl Workspace {
                     }
                     while let Some(event) = events.recv().await {
                         if weak
-                            .update(cx, |workspace, cx| workspace.on_event(event, cx))
+                            .update_in(cx, |workspace, window, cx| {
+                                workspace.on_event(event, window, cx)
+                            })
                             .is_err()
                         {
                             break;
@@ -162,13 +172,13 @@ impl Workspace {
             search,
             editor: None,
             tabs: Vec::new(),
+            tab_scroll: ScrollHandle::new(),
             active: None,
             terminal,
             confirm: None,
             message: Some("Opening local connections…".into()),
             file_warning: None,
             file_warnings,
-            hosts_visible: true,
             pending: HashMap::new(),
             serial: 0,
             _startup: startup,
@@ -213,7 +223,7 @@ impl Workspace {
         }
     }
 
-    fn on_event(&mut self, event: ConnectionEvent, cx: &mut Context<Self>) {
+    fn on_event(&mut self, event: ConnectionEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(manager) = self.connections.clone() else {
             return;
         };
@@ -243,6 +253,7 @@ impl Workspace {
             } else {
                 self.tabs.push(state);
                 self.select_tab(id, cx);
+                self.focus_active(window, cx);
             }
             if self.active == Some(id) {
                 self.terminal.update(cx, |terminal, cx| {
@@ -285,6 +296,9 @@ impl Workspace {
                 };
                 tab.prompt = Some((prompt.id, kind));
                 tab.status = "Waiting for your response".into();
+                if self.active == Some(id) && self.editor.is_none() && self.confirm.is_none() {
+                    self.focus_active(window, cx);
+                }
             }
             ConnectionEventKind::Connected { recent_error } => {
                 if tab.finished {
@@ -336,20 +350,38 @@ impl Workspace {
         self.active = Some(id);
         self.editor = None;
         self.confirm = None;
+        if let Some(index) = self.tabs.iter().position(|tab| tab.attempt.tab == id) {
+            self.tab_scroll.scroll_to_item(index);
+        }
         self.terminal.update(cx, |terminal, _| terminal.reset());
         self.sync_terminal(cx);
         cx.notify();
     }
 
-    fn focus_active(&self, window: &mut Window, cx: &App) {
-        let files = self.active.and_then(|id| {
-            let tab = self
-                .tabs
-                .iter()
-                .find(|tab| tab.attempt.tab == id && tab.showing_files)?;
-            tab.files.as_ref()
+    fn select_hosts(&mut self, cx: &mut Context<Self>) {
+        self.active = None;
+        self.editor = None;
+        self.confirm = None;
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.reset();
+            terminal.set_frame(None, cx);
         });
-        if let Some(files) = files {
+        cx.notify();
+    }
+
+    fn focus_active(&self, window: &mut Window, cx: &App) {
+        let Some(tab) = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.attempt.tab == id))
+        else {
+            self.search.focus_handle(cx).focus(window);
+            return;
+        };
+        if let Some((_, prompt)) = &tab.prompt {
+            if let Some(field) = prompt.field() {
+                field.focus_handle(cx).focus(window);
+            }
+        } else if let Some(files) = tab.files.as_ref().filter(|_| tab.showing_files) {
             files.focus_handle(cx).focus(window);
         } else {
             self.terminal.focus_handle(cx).focus(window);
@@ -615,12 +647,12 @@ impl Workspace {
             field.update(cx, Field::clear);
         }
         if self.active == Some(id) {
-            self.active = None;
-            if let Some(next) = self.tabs.get(index.min(self.tabs.len().saturating_sub(1))) {
+            if let Some(next) = neighbor_after_close(self.tabs.len(), index)
+                .and_then(|neighbor| self.tabs.get(neighbor))
+            {
                 self.select_tab(next.attempt.tab, cx);
             } else {
-                self.terminal
-                    .update(cx, |terminal, cx| terminal.set_frame(None, cx));
+                self.select_hosts(cx);
             }
         }
         self.run(async move { manager.close(id).await }, cx, |_, _, _| {});
@@ -671,29 +703,40 @@ impl Workspace {
     pub(crate) fn button<View: 'static>(
         cx: &Context<View>,
         id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
+        label: impl IntoElement,
         clicked: impl Fn(&mut View, &mut Window, &mut Context<View>) + 'static,
-    ) -> AnyElement {
+    ) -> Stateful<Div> {
         div()
             .id(id)
             .tab_stop(true)
             .cursor_pointer()
+            .flex()
+            .items_center()
             .px_2()
             .py_1()
             .rounded_sm()
             .border_1()
-            .border_color(rgb(0x525f71))
+            .border_color(rgb(RULE))
             .bg(rgb(0x272e38))
             .hover(|style| style.bg(rgb(0x354154)))
-            .focus(|style| style.border_color(rgb(0x9dbefa)))
+            .active(|style| style.bg(rgb(0x202936)))
+            .focus(|style| style.border_color(rgb(FOCUS)))
             .on_click(cx.listener(move |workspace, _: &ClickEvent, window, cx| {
                 clicked(workspace, window, cx)
             }))
-            .child(label.into())
-            .into_any_element()
+            .child(label)
     }
 
-    fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
+    fn primary(button: Stateful<Div>) -> Stateful<Div> {
+        button
+            .font_weight(FontWeight::SEMIBOLD)
+            .bg(rgb(0x304766))
+            .border_color(rgb(0x58799f))
+            .hover(|style| style.bg(rgb(0x3c587b)))
+            .active(|style| style.bg(rgb(0x263c59)))
+    }
+
+    fn hosts_screen(&self, cx: &Context<Self>) -> AnyElement {
         let search = self.search.read(cx).text().trim().to_lowercase();
         let mut list = div()
             .id("saved-profiles")
@@ -701,18 +744,14 @@ impl Workspace {
             .min_h_0()
             .overflow_y_scroll()
             .flex()
-            .flex_col()
-            .gap_2();
+            .flex_col();
         let mut count = 0;
-        for (index, profile) in self.profiles.iter().enumerate() {
+        for profile in &self.profiles {
             let draft = &profile.draft;
-            if ![
-                draft.label.as_str(),
-                draft.target.username(),
-                draft.target.endpoint().host(),
-            ]
-            .iter()
-            .any(|text| text.to_lowercase().contains(&search))
+            let address = format!("{}@{}", draft.target.username(), draft.target.endpoint());
+            if ![draft.label.as_str(), &address]
+                .iter()
+                .any(|text| text.to_lowercase().contains(&search))
             {
                 continue;
             }
@@ -721,52 +760,60 @@ impl Workspace {
             let label = draft.label.clone();
             list = list.child(
                 div()
+                    .id(SharedString::from(format!("{id:?}")))
                     .flex_shrink_0()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .bg(rgb(0x222831))
-                    .rounded_sm()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_x_4()
+                    .gap_y_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(RULE))
+                    .bg(rgb(SURFACE))
+                    .hover(|style| style.bg(rgb(0x29313c)))
                     .child(
                         div()
-                            .truncate()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(label.clone()),
+                            .flex_1()
+                            .flex_basis(px(175.))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(address),
+                            )
+                            .when(profile.last_connected.is_some(), |details| {
+                                details.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child("Recently connected"),
+                                )
+                            }),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(rgb(0xb7c1d0))
-                            .child(format!(
-                                "{}@{}",
-                                draft.target.username(),
-                                draft.target.endpoint()
-                            )),
-                    )
-                    .when(profile.last_connected.is_some(), |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xa9c8aa))
-                                .child("Recently connected"),
-                        )
-                    })
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
-                            .gap_1()
-                            .child(Self::button(
+                            .gap_2()
+                            .child(Self::primary(Self::button(
                                 cx,
-                                ("connect-profile", index),
+                                "connect-profile",
                                 "Connect",
                                 move |view, _, cx| view.connect_profile(id, cx),
-                            ))
+                            )))
                             .child(Self::button(
                                 cx,
-                                ("edit-profile", index),
+                                "edit-profile",
                                 "Edit",
                                 move |view, window, cx| {
                                     view.editor(EditorMode::Edit(id), window, cx)
@@ -774,7 +821,7 @@ impl Workspace {
                             ))
                             .child(Self::button(
                                 cx,
-                                ("delete-profile", index),
+                                "delete-profile",
                                 "Delete",
                                 move |view, _, cx| {
                                     view.confirm = Some(Confirm::Delete(id, label.clone()));
@@ -786,39 +833,137 @@ impl Workspace {
             );
         }
         if count == 0 {
-            list = list.child(if search.is_empty() {
-                "No saved hosts. Add a host to connect again later."
-            } else {
-                "No matching hosts."
-            });
+            list = list.child(div().p_3().text_color(rgb(MUTED)).child(
+                if self.connections.is_none() {
+                    "Saved hosts are not available yet."
+                } else if search.is_empty() {
+                    "No saved hosts. Choose New host to add one."
+                } else {
+                    "No hosts match your search."
+                },
+            ));
         }
         div()
-            .w(px(208.))
-            .flex_shrink_0()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .max_w(px(880.))
+            .mx_auto()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_2()
-            .bg(rgb(0x1c2128))
-            .border_r_1()
-            .border_color(rgb(0x39434f))
+            .gap_3()
+            .p_3()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Saved hosts"),
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Saved hosts"),
+                    )
+                    .when(self.connections.is_some(), |header| {
+                        header.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(Self::button(
+                                    cx,
+                                    "quick-connect",
+                                    "Quick Connect",
+                                    |view, window, cx| view.editor(EditorMode::Quick, window, cx),
+                                ))
+                                .child(Self::primary(Self::button(
+                                    cx,
+                                    "new-host",
+                                    "New host",
+                                    |view, window, cx| view.editor(EditorMode::New, window, cx),
+                                ))),
+                        )
+                    }),
             )
             .child(self.search.clone())
-            .when(self.connections.is_some(), |side| {
-                side.child(Self::button(
-                    cx,
-                    "new-host",
-                    "New host",
-                    |view, window, cx| view.editor(EditorMode::New, window, cx),
-                ))
-            })
             .child(list)
             .into_any_element()
+    }
+
+    fn tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let hosts = Self::button(cx, "hosts-tab", "Hosts", |view, window, cx| {
+            view.select_hosts(cx);
+            view.focus_active(window, cx);
+        })
+        .flex_shrink_0()
+        .px_3()
+        .when(self.active.is_none(), Self::primary);
+        let sessions = div()
+            .id("ssh-tabs")
+            .track_scroll(&self.tab_scroll)
+            .overflow_x_scroll()
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(self.tabs.iter().map(|tab| {
+                let id = tab.attempt.tab;
+                let title = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(div().min_w_0().truncate().child(tab.label.clone()))
+                    .when(tab.prompt.is_some(), |title| {
+                        title.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(rgb(0xffcf88))
+                                .child("Respond"),
+                        )
+                    });
+                let select = Self::button(cx, "select-tab", title, move |view, window, cx| {
+                    view.select_tab(id, cx);
+                    view.focus_active(window, cx);
+                })
+                .max_w(px(152.))
+                .when(self.active == Some(id), Self::primary);
+                div()
+                    .id(SharedString::from(format!("{id:?}")))
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(select)
+                    .child(
+                        Self::button(cx, "close-tab", "Close", move |view, window, cx| {
+                            let was_active = view.active == Some(id);
+                            view.remove(id, cx);
+                            if was_active {
+                                view.focus_active(window, cx);
+                            }
+                        })
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .border_color(gpui::transparent_black())
+                        .bg(gpui::transparent_black()),
+                    )
+            }));
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(rgb(CHROME))
+            .border_b_1()
+            .border_color(rgb(RULE))
+            .child(hosts)
+            .child(sessions)
     }
 
     fn editor_panel(&self, editor: &Editor, cx: &Context<Self>) -> AnyElement {
@@ -987,8 +1132,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = self.hosts_visible && window.viewport_size().width >= px(540.);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.attempt.tab == id));
@@ -1002,76 +1146,6 @@ impl Render for Workspace {
                 .and_then(|tab| tab.prompt.as_ref())
                 .map(|(id, prompt)| (forms[2], self.prompt_panel(*id, prompt, cx)))
         };
-        let mut strip = div()
-            .id("ssh-tabs")
-            .overflow_x_scroll()
-            .flex()
-            .gap_1()
-            .p_1()
-            .bg(rgb(0x1c2128))
-            .border_b_1()
-            .border_color(rgb(0x39434f));
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let id = tab.attempt.tab;
-            let label = if tab.prompt.is_some() {
-                format!("{} · response needed", tab.label)
-            } else {
-                tab.label.clone()
-            };
-            strip = strip.child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .when(self.active == Some(id), |row| row.bg(rgb(0x3e536e)))
-                    .child(Self::button(
-                        cx,
-                        ("select-tab", index),
-                        label,
-                        move |view, window, cx| {
-                            view.select_tab(id, cx);
-                            view.focus_active(window, cx);
-                        },
-                    ))
-                    .child(Self::button(
-                        cx,
-                        ("close-tab", index),
-                        "Close",
-                        move |view, _, cx| view.remove(id, cx),
-                    )),
-            );
-        }
-        let toolbar = div()
-            .flex()
-            .flex_wrap()
-            .gap_2()
-            .p_2()
-            .bg(rgb(0x20252d))
-            .when(self.connections.is_some(), |toolbar| {
-                toolbar
-                    .child(Self::button(
-                        cx,
-                        "quick-connect",
-                        "Quick Connect",
-                        |view, window, cx| view.editor(EditorMode::Quick, window, cx),
-                    ))
-                    .child(Self::button(
-                        cx,
-                        "toggle-saved-hosts",
-                        "Saved hosts",
-                        |view, window, cx| {
-                            if window.viewport_size().width >= px(540.) {
-                                view.hosts_visible = !view.hosts_visible;
-                            } else {
-                                view.hosts_visible = true;
-                                view.active = None;
-                                view.editor = None;
-                                view.confirm = None;
-                            }
-                            cx.notify();
-                        },
-                    ))
-            });
         let body = if let Some((id, panel)) = panel {
             div()
                 .id(id)
@@ -1145,29 +1219,16 @@ impl Render for Workspace {
                 )
                 .child(div().flex_1().min_h_0().child(contents))
                 .into_any_element()
-        } else if !sidebar && window.viewport_size().width < px(540.) && self.hosts_visible {
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(self.sidebar(cx))
-                .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_3()
-                .text_color(rgb(0xb7c1d0))
-                .child("No active session. Open Quick Connect or choose a saved host.")
-                .into_any_element()
+            self.hosts_screen(cx)
         };
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x181b20))
+            .bg(rgb(WORKSPACE))
             .text_color(rgb(0xe9ecf1))
+            .font_family("Segoe UI")
             .text_sm()
             .on_key_down(|event: &KeyDownEvent, window, cx: &mut App| {
                 if event.keystroke.key == "tab" {
@@ -1179,7 +1240,7 @@ impl Render for Workspace {
                     cx.stop_propagation();
                 }
             })
-            .child(toolbar)
+            .child(self.tab_bar(cx))
             .when_some(self.message.clone(), |root, message| {
                 root.child(div().px_2().py_1().bg(rgb(0x303744)).child(message))
             })
@@ -1204,24 +1265,12 @@ impl Render for Workspace {
                         )),
                 )
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .when(sidebar, |row| row.child(self.sidebar(cx)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .when(!self.tabs.is_empty(), |right| right.child(strip))
-                            .child(body),
-                    ),
-            )
+            .child(body)
     }
+}
+
+fn neighbor_after_close(remaining: usize, closed_index: usize) -> Option<usize> {
+    remaining.checked_sub(1).map(|last| closed_index.min(last))
 }
 
 fn take_matching<I: PartialEq, T>(slot: &mut Option<(I, T)>, id: I) -> Option<T> {
@@ -1235,6 +1284,14 @@ fn take_matching<I: PartialEq, T>(slot: &mut Option<(I, T)>, id: I) -> Option<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_active_tab_chooses_neighbor_or_hosts() {
+        assert_eq!(neighbor_after_close(2, 0), Some(0));
+        assert_eq!(neighbor_after_close(2, 1), Some(1));
+        assert_eq!(neighbor_after_close(2, 2), Some(1));
+        assert_eq!(neighbor_after_close(0, 0), None);
+    }
 
     #[test]
     fn prompt_submit_uses_its_own_id_after_tab_switch() {
