@@ -278,6 +278,7 @@ impl Render for Field {
             .child(
                 div()
                     .track_focus(&self.focus)
+                    .w_full()
                     .on_key_down(cx.listener(Self::on_key))
                     .on_mouse_down(
                         MouseButton::Left,

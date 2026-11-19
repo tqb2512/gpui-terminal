@@ -31,9 +31,10 @@ cargo run --locked -p terminal_client
 - **Quick Connect:** Enter `user@host` or `user@host:2222` and select **Password**
   or **Private key**. For IPv6 with a port, use `user@[2001:db8::1]:2222`.
   Quick Connect does not save a profile.
-- **Saved hosts:** Choose **New host** to save a display name, address, and
-  authentication method. Use the search field or choose **Connect**, **Edit**,
-  or **Delete** beside a host. The most recently connected hosts appear first.
+- **Saved hosts:** The app starts on the **Hosts** tab. Choose **New host** to
+  save a display name, address, and authentication method. Use the search field
+  or choose **Connect**, **Edit**, or **Delete** beside a host. The most recently
+  connected hosts appear first.
   Editing or deleting a host leaves its open tabs and trusted key alone.
 - **Verify the host first:** Compare the app’s SHA-256 fingerprint with a trusted
   source, such as your server administrator, before approving it. The app then
@@ -43,7 +44,8 @@ cargo run --locked -p terminal_client
   verified, choose **Forget host key…** on the failed tab, confirm, and then
   **Reconnect** and verify the new fingerprint. Forgetting a key does not close
   established sessions.
-- **Terminal tabs:** Each connection opens a new tab. Use **Close** to end just
+- **Terminal tabs:** Each connection opens a tab next to **Hosts** at the top.
+  Return to **Hosts** without disconnecting. Use **Close** to end just
   that tab. **Reconnect** opens a new remote shell and does not replay input.
   Drag to select, use **Ctrl+Shift+C** and **Ctrl+Shift+V** for copy and paste,
   and use **Ctrl+Tab** to move focus out of the terminal.
@@ -56,12 +58,14 @@ forgetting a key revokes all pending attempts that use it.
 
 ## Browse and edit remote files
 
-Choose **Files** in a connected SSH tab. Browse from the remote home directory
-and use **Upload…** or select a regular file and choose **Download…**. Transfers
-do not overwrite existing destinations. Select **Terminal** to return to the
-shell without disconnecting. Upload requires `hardlink@openssh.com` and hard
-links on the destination filesystem so the app can publish without replacing
-an existing file. Browsing and downloads do not require that extension.
+Choose **Files** in a connected SSH tab to open the browser on the left. The
+terminal narrows and stays usable beside it. Browse from the remote home
+directory and use **Upload…** or select a regular file and choose **Download…**.
+Transfers do not overwrite existing destinations. **Hide Files** gives the shell
+the full width again without interrupting transfers or save-back.
+Upload requires `hardlink@openssh.com` and hard links on the destination
+filesystem so the app can publish without replacing an existing file. Browsing
+and downloads do not require that extension.
 
 **Open with…** copies a supported file (up to 32 MiB) to Windows and prompts for
 a local app. Save normally in that app. The Files view reports when the save
@@ -105,11 +109,14 @@ On a Windows x64 desktop, use an SSH server you control:
    fingerprint.
 5. Check keyboard focus and small/high-DPI window layouts, then close the last
    window and verify the app exits. Repeat with the system SSH client absent.
-6. Use Files on two hosts with terminals still active. Upload and download a
-   regular file, try a destination that already exists, and cancel each native
-   picker. Select a Windows shortcut in the upload picker and verify that
-   neither it nor its target is sent. Open a supported file once in Notepad and
-   once in an editor that saves by replacing the file. Save twice, then test a
+6. Open Files on two hosts, go to a different folder in each, and hide one
+   browser. Switch through **Hosts** and back to each session and check that
+   its folder and visibility are preserved. Toggle Files in a narrow window
+   and verify the shell resizes and gets keyboard focus when Files closes.
+   Upload and download a regular file, try an existing destination, and cancel
+   each native picker. Select a Windows shortcut in the upload picker and
+   verify neither it nor its target is sent. Open a supported file once in
+   Notepad and once in an editor that saves by replacing the file. Save twice, then test a
    remote conflict and disconnect during an edit; verify that the local copy
    survives and reconnect does not send it automatically.
 

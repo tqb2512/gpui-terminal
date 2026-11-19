@@ -109,7 +109,7 @@ fn main() -> ExitCode {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| Workspace::new(handle, cx)),
+                |window, cx| cx.new(|cx| Workspace::new(handle, window, cx)),
             );
             if let Err(error) = window {
                 eprintln!("Could not open the terminal window: {error:#}");

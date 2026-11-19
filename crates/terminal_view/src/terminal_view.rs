@@ -78,6 +78,8 @@ impl TerminalView {
     }
 
     pub fn reset(&mut self) {
+        // The next session may show a differently sized terminal beside Files.
+        self.geometry.set(None);
         self.drag_start = None;
         self.composing = false;
     }
