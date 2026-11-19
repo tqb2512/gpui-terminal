@@ -777,7 +777,8 @@ impl Workspace {
 
     fn hosts_screen(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let search = self.search.read(cx).text().trim().to_lowercase();
-        let compact = window.viewport_size().width < px(380.);
+        let width = window.viewport_size().width;
+        let compact = width < px(380.);
         let mut list = div().flex().flex_col();
         let mut count = 0;
         for profile in &self.profiles {
@@ -885,8 +886,7 @@ impl Workspace {
             .overflow_y_scroll()
             .child(
                 div()
-                    .w_full()
-                    .max_w(px(880.))
+                    .w(width.min(px(880.)))
                     .mx_auto()
                     .flex()
                     .flex_col()
@@ -901,7 +901,7 @@ impl Workspace {
                             .gap_2()
                             .child(
                                 div()
-                                    .when(compact, |heading| heading.text_lg())
+                                    .when(compact, |heading| heading.text_base())
                                     .when(!compact, |heading| heading.text_xl())
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Saved hosts"),
@@ -911,7 +911,7 @@ impl Workspace {
                                     div()
                                         .flex()
                                         .gap_2()
-                                        .when(compact, |actions| actions.text_xs())
+                                        .when(compact, |actions| actions.gap_1().text_xs())
                                         .child(Self::button(
                                             cx,
                                             "quick-connect",
