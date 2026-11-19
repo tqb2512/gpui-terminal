@@ -114,9 +114,9 @@ On a Windows x64 desktop, use an SSH server you control:
    its folder and visibility are preserved. Toggle Files in a narrow window
    and verify the shell resizes and gets keyboard focus when Files closes.
    Upload and download a regular file, try an existing destination, and cancel
-   each native picker. Select a Windows shortcut in the upload picker and verify that
-   neither it nor its target is sent. Open a supported file once in Notepad and
-   once in an editor that saves by replacing the file. Save twice, then test a
+   each native picker. Select a Windows shortcut in the upload picker and
+   verify neither it nor its target is sent. Open a supported file once in
+   Notepad and once in an editor that saves by replacing the file. Save twice, then test a
    remote conflict and disconnect during an edit; verify that the local copy
    survives and reconnect does not send it automatically.
 

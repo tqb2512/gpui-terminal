@@ -4,8 +4,8 @@ use std::{
 };
 
 use gpui::{
-    Context, FocusHandle, Focusable, FontWeight, IntoElement, Render, ScrollHandle, Task, Window,
-    div, point, prelude::*, px, rgb,
+    Context, Div, FocusHandle, Focusable, FontWeight, IntoElement, Render, ScrollHandle, Stateful,
+    Task, WeakFocusHandle, Window, div, point, prelude::*, px, rgb,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use ssh::{RemoteEntry, RemoteKind, RemotePath, SftpError};
@@ -54,8 +54,8 @@ pub(crate) struct FilesView {
     warnings: mpsc::Sender<String>,
     request: Request,
     focus: FocusHandle,
+    last_focus: Option<WeakFocusHandle>,
     scroll: ScrollHandle,
-    path_scroll: ScrollHandle,
     files: Option<AttemptFiles>,
     directory: Option<RemotePath>,
     entries: Vec<RemoteEntry>,
@@ -108,8 +108,8 @@ impl FilesView {
             warnings,
             request: Request::default(),
             focus: cx.focus_handle().tab_stop(true),
+            last_focus: None,
             scroll: ScrollHandle::new(),
-            path_scroll: ScrollHandle::new(),
             files: None,
             directory: None,
             entries: Vec::new(),
@@ -202,7 +202,6 @@ impl FilesView {
                 view.files = Some(files);
                 if view.directory.as_ref() != Some(&path) {
                     view.scroll.set_offset(point(px(0.), px(0.)));
-                    view.path_scroll.set_offset(point(px(0.), px(0.)));
                 }
                 view.directory = Some(path);
                 view.entries = entries;
@@ -437,32 +436,82 @@ pub(crate) fn edits_root() -> Option<PathBuf> {
     )
 }
 
+fn reveal_focused(
+    button: Stateful<Div>,
+    scroll: &ScrollHandle,
+    new_focus: Option<&FocusHandle>,
+    window: &mut Window,
+    cx: &mut Context<FilesView>,
+) -> Div {
+    let Some(id) = gpui::Element::id(&button) else {
+        return div().child(button);
+    };
+    let focus = window
+        .use_keyed_state(id, cx, |_, cx| cx.focus_handle().tab_stop(true))
+        .read(cx)
+        .clone();
+    let mut row = div().child(button.track_focus(&focus));
+    if new_focus == Some(&focus) {
+        let scroll = scroll.clone();
+        row = row.on_children_prepainted(move |children, window, _| {
+            let Some(bounds) = children.first() else {
+                return;
+            };
+            let viewport = scroll.bounds();
+            let delta =
+                if bounds.top() < viewport.top() || bounds.size.height > viewport.size.height {
+                    viewport.top() - bounds.top()
+                } else {
+                    (viewport.bottom() - bounds.bottom()).min(px(0.))
+                };
+            if delta != px(0.) {
+                let mut offset = scroll.offset();
+                offset.y += delta;
+                let scroll = scroll.clone();
+                window.on_next_frame(move |window, _| {
+                    scroll.set_offset(offset);
+                    window.refresh();
+                });
+            }
+        });
+    }
+    row
+}
+
 impl Render for FilesView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = window.focused(cx);
+        let weak = current.as_ref().map(FocusHandle::downgrade);
+        let new_focus = current.as_ref().filter(|_| self.last_focus != weak);
+        self.last_focus = weak;
+        let mut reveal = |button, cx: &mut Context<Self>| {
+            reveal_focused(button, &self.scroll, new_focus, window, cx)
+        };
         let ready = self.pending.is_none() && self.request.is_current();
         let directory = self.directory.clone();
         let parent = directory.as_ref().and_then(RemotePath::parent);
         let mut tools = div().flex().flex_wrap().gap_1();
         if ready {
             if let Some(parent) = parent {
-                tools = tools.child(Workspace::button(cx, "up", "Up", move |view, _, cx| {
-                    view.load(Some(parent.clone()), cx);
-                }));
+                tools = tools.child(reveal(
+                    Workspace::button(cx, "up", "Up", move |view, _, cx| {
+                        view.load(Some(parent.clone()), cx);
+                    }),
+                    cx,
+                ));
             }
-            tools = tools.child(Workspace::button(
-                cx,
-                "refresh",
-                "Refresh",
-                |view, _, cx| {
+            tools = tools.child(reveal(
+                Workspace::button(cx, "refresh", "Refresh", |view, _, cx| {
                     view.load(view.directory.clone(), cx);
-                },
+                }),
+                cx,
             ));
             if directory.is_some() {
-                tools = tools.child(Workspace::button(
+                tools = tools.child(reveal(
+                    Workspace::button(cx, "upload", "Upload…", |view, window, cx| {
+                        view.upload(window, cx)
+                    }),
                     cx,
-                    "upload",
-                    "Upload…",
-                    |view, window, cx| view.upload(window, cx),
                 ));
             }
         }
@@ -488,13 +537,13 @@ impl Render for FilesView {
                 let label = div()
                     .w_full()
                     .min_w_0()
-                    .child(div().truncate().child(entry.name.clone()))
+                    .child(div().w_full().child(entry.name.clone()))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(if active {
                         format!("Selected · {suffix}")
                     } else {
                         suffix
                     }));
-                list = list.child(
+                list = list.child(reveal(
                     Workspace::button(cx, ("remote-entry", index), label, move |view, _, cx| {
                         if view.pending.is_some() || !view.request.is_current() {
                             return;
@@ -509,7 +558,8 @@ impl Render for FilesView {
                     .bg(rgb(SURFACE))
                     .border_color(gpui::transparent_black())
                     .when(active, |row| row.bg(rgb(0x304766))),
-                );
+                    cx,
+                ));
             }
             if self.entries.is_empty() && ready {
                 list = list.child(
@@ -522,22 +572,22 @@ impl Render for FilesView {
             }
         }
         if ready && matches!(self.selected, Some((_, RemoteKind::File))) {
-            tools = tools.child(Workspace::button(
+            tools = tools.child(reveal(
+                Workspace::button(cx, "download", "Download…", |view, _, cx| {
+                    view.download(cx)
+                }),
                 cx,
-                "download",
-                "Download…",
-                |view, _, cx| view.download(cx),
             ));
             if self
                 .files
                 .as_ref()
                 .is_some_and(AttemptFiles::supports_atomic_replace)
             {
-                tools = tools.child(Workspace::button(
+                tools = tools.child(reveal(
+                    Workspace::button(cx, "open-with", "Open with…", |view, window, cx| {
+                        view.open_with(window, cx)
+                    }),
                     cx,
-                    "open-with",
-                    "Open with…",
-                    |view, window, cx| view.open_with(window, cx),
                 ));
             } else {
                 tools = tools.child(
@@ -569,25 +619,31 @@ impl Render for FilesView {
                             .flex()
                             .flex_wrap()
                             .gap_1()
-                            .child(Workspace::button(
+                            .child(reveal(
+                                Workspace::button(
+                                    cx,
+                                    ("show-copy", index),
+                                    "Show local copy",
+                                    move |_, _, cx| cx.reveal_path(&path),
+                                ),
                                 cx,
-                                ("show-copy", index),
-                                "Show local copy",
-                                move |_, _, cx| cx.reveal_path(&path),
                             ))
-                            .child(Workspace::button(
+                            .child(reveal(
+                                Workspace::button(
+                                    cx,
+                                    ("finish-edit", index),
+                                    "Finish editing",
+                                    move |view, _, cx| {
+                                        if index < view.edits.len() {
+                                            view.edits.remove(index);
+                                            view.message = edits_root().map(|path| {
+                                                format!("Local copy kept in {}.", path.display())
+                                            });
+                                            cx.notify();
+                                        }
+                                    },
+                                ),
                                 cx,
-                                ("finish-edit", index),
-                                "Finish editing",
-                                move |view, _, cx| {
-                                    if index < view.edits.len() {
-                                        view.edits.remove(index);
-                                        view.message = edits_root().map(|path| {
-                                            format!("Local copy kept in {}.", path.display())
-                                        });
-                                        cx.notify();
-                                    }
-                                },
                             )),
                     ),
             );
@@ -616,21 +672,12 @@ impl Render for FilesView {
                     .when_some(directory, |body, directory| {
                         body.child(
                             div()
-                                .id("remote-path")
-                                .track_scroll(&self.path_scroll)
-                                .flex()
-                                .overflow_x_scroll()
-                                .whitespace_nowrap()
+                                .w_full()
                                 .font_family("Consolas")
                                 .text_xs()
                                 .text_color(rgb(MUTED))
                                 .pb_2()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .min_h(px(16.))
-                                        .child(directory.as_str().to_owned()),
-                                ),
+                                .child(directory.as_str().to_owned()),
                         )
                     })
                     .child(tools)

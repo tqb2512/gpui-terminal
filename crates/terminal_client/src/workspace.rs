@@ -37,6 +37,7 @@ pub(crate) struct Workspace {
     active: Option<TabId>,
     terminal: Entity<TerminalView>,
     confirm: Option<Confirm>,
+    panel_focus: FocusHandle,
     message: Option<String>,
     file_warning: Option<String>,
     file_warnings: tokio::sync::mpsc::Sender<String>,
@@ -105,8 +106,13 @@ enum Confirm {
 }
 
 impl Workspace {
-    pub fn new(runtime: tokio::runtime::Handle, window: &Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| Field::new("Search saved hosts", "", false, cx));
+        search.focus_handle(cx).focus(window);
         let terminal = cx.new(TerminalView::new);
         let (file_warnings, mut warnings) = tokio::sync::mpsc::channel(16);
         let warning_task = cx.spawn(async move |weak, cx| {
@@ -179,6 +185,7 @@ impl Workspace {
             active: None,
             terminal,
             confirm: None,
+            panel_focus: cx.focus_handle(),
             message: Some("Opening local connections…".into()),
             file_warning: None,
             file_warnings,
@@ -333,12 +340,8 @@ impl Workspace {
                 if let Some(files) = &tab.files {
                     files.update(cx, FilesView::disconnect);
                 }
-                if let Some(field) = tab
-                    .prompt
-                    .take()
-                    .as_ref()
-                    .and_then(|(_, prompt)| prompt.field())
-                {
+                let prompt = tab.prompt.take();
+                if let Some(field) = prompt.as_ref().and_then(|(_, prompt)| prompt.field()) {
                     field.update(cx, Field::clear);
                 }
                 tab.finished = true;
@@ -347,6 +350,13 @@ impl Workspace {
                     Ok(()) => "Disconnected".into(),
                     Err(error) => error.to_string(),
                 };
+                if self.active == Some(id)
+                    && prompt.is_some()
+                    && self.editor.is_none()
+                    && self.confirm.is_none()
+                {
+                    self.focus_active(window, cx);
+                }
             }
             ConnectionEventKind::Starting { .. } => {}
         }
@@ -377,6 +387,18 @@ impl Workspace {
     }
 
     fn focus_active(&self, window: &mut Window, cx: &App) {
+        if let Some(editor) = &self.editor {
+            let field = match editor.mode {
+                EditorMode::Quick => &editor.address,
+                _ => &editor.label,
+            };
+            field.focus_handle(cx).focus(window);
+            return;
+        }
+        if self.confirm.is_some() {
+            self.panel_focus.focus(window);
+            return;
+        }
         let Some(tab) = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.attempt.tab == id))
@@ -387,6 +409,8 @@ impl Workspace {
         if let Some((_, prompt)) = &tab.prompt {
             if let Some(field) = prompt.field() {
                 field.focus_handle(cx).focus(window);
+            } else {
+                self.panel_focus.focus(window);
             }
         } else {
             self.terminal.focus_handle(cx).focus(window);
@@ -518,7 +542,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn submit_editor(&mut self, cx: &mut Context<Self>) {
+    fn submit_editor(&mut self, window: &Window, cx: &mut Context<Self>) {
         let (Some(editor), Some(manager)) = (&self.editor, self.connections.clone()) else {
             return;
         };
@@ -542,6 +566,7 @@ impl Workspace {
             },
             mode => match profile_draft(editor.label.read(cx).text(), address, editor.key, path) {
                 Ok(draft) => {
+                    let window = window.window_handle();
                     let id = match mode {
                         EditorMode::Edit(id) => Some(id),
                         _ => None,
@@ -549,10 +574,13 @@ impl Workspace {
                     self.run(
                         async move { manager.save_profile(id, draft).await },
                         cx,
-                        |workspace, _, cx| {
+                        move |workspace, _, cx| {
                             workspace.editor = None;
                             workspace.message = None;
                             workspace.refresh(cx);
+                            let _ = window.update(cx, |_, window, cx| {
+                                workspace.focus_active(window, cx);
+                            });
                         },
                     );
                 }
@@ -721,7 +749,7 @@ impl Workspace {
     ) -> Stateful<Div> {
         div()
             .id(id)
-            .tab_stop(true)
+            .tab_index(0)
             .cursor_pointer()
             .flex()
             .items_center()
@@ -745,19 +773,12 @@ impl Workspace {
             .font_weight(FontWeight::SEMIBOLD)
             .bg(rgb(0x304766))
             .border_color(rgb(0x58799f))
-            .hover(|style| style.bg(rgb(0x3c587b)))
-            .active(|style| style.bg(rgb(0x263c59)))
     }
 
-    fn hosts_screen(&self, cx: &Context<Self>) -> AnyElement {
+    fn hosts_screen(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let search = self.search.read(cx).text().trim().to_lowercase();
-        let mut list = div()
-            .id("saved-profiles")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col();
+        let compact = window.viewport_size().width < px(380.);
+        let mut list = div().flex().flex_col();
         let mut count = 0;
         for profile in &self.profiles {
             let draft = &profile.draft;
@@ -793,7 +814,7 @@ impl Workspace {
                             .min_w_0()
                             .child(
                                 div()
-                                    .truncate()
+                                    .w_full()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(label.clone()),
                             )
@@ -836,9 +857,10 @@ impl Workspace {
                                 cx,
                                 "delete-profile",
                                 "Delete",
-                                move |view, _, cx| {
+                                move |view, window, cx| {
                                     view.confirm = Some(Confirm::Delete(id, label.clone()));
                                     view.editor = None;
+                                    view.focus_active(window, cx);
                                     cx.notify();
                                 },
                             )),
@@ -857,50 +879,61 @@ impl Workspace {
             ));
         }
         div()
+            .id("saved-profiles")
             .flex_1()
             .min_h_0()
-            .w_full()
-            .max_w(px(880.))
-            .mx_auto()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_3()
+            .overflow_y_scroll()
             .child(
                 div()
+                    .w_full()
+                    .max_w(px(880.))
+                    .mx_auto()
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                    .flex_col()
+                    .gap_3()
+                    .p_3()
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Saved hosts"),
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .when(compact, |heading| heading.text_lg())
+                                    .when(!compact, |heading| heading.text_xl())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Saved hosts"),
+                            )
+                            .when(self.connections.is_some(), |header| {
+                                header.child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .when(compact, |actions| actions.text_xs())
+                                        .child(Self::button(
+                                            cx,
+                                            "quick-connect",
+                                            "Quick Connect",
+                                            |view, window, cx| {
+                                                view.editor(EditorMode::Quick, window, cx)
+                                            },
+                                        ))
+                                        .child(Self::primary(Self::button(
+                                            cx,
+                                            "new-host",
+                                            "New host",
+                                            |view, window, cx| {
+                                                view.editor(EditorMode::New, window, cx)
+                                            },
+                                        ))),
+                                )
+                            }),
                     )
-                    .when(self.connections.is_some(), |header| {
-                        header.child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(Self::button(
-                                    cx,
-                                    "quick-connect",
-                                    "Quick Connect",
-                                    |view, window, cx| view.editor(EditorMode::Quick, window, cx),
-                                ))
-                                .child(Self::primary(Self::button(
-                                    cx,
-                                    "new-host",
-                                    "New host",
-                                    |view, window, cx| view.editor(EditorMode::New, window, cx),
-                                ))),
-                        )
-                    }),
+                    .child(self.search.clone())
+                    .child(list),
             )
-            .child(self.search.clone())
-            .child(list)
             .into_any_element()
     }
 
@@ -966,11 +999,8 @@ impl Workspace {
                     .child(select)
                     .child(
                         Self::button(cx, "close-tab", "Close", move |view, window, cx| {
-                            let was_active = view.active == Some(id);
                             view.remove(id, cx);
-                            if was_active {
-                                view.focus_active(window, cx);
-                            }
+                            view.focus_active(window, cx);
                         })
                         .text_xs()
                         .text_color(rgb(MUTED))
@@ -1055,15 +1085,19 @@ impl Workspace {
                     .flex()
                     .flex_wrap()
                     .gap_2()
-                    .child(Self::button(cx, "submit-editor", action, |view, _, cx| {
-                        view.submit_editor(cx)
-                    }))
+                    .child(Self::button(
+                        cx,
+                        "submit-editor",
+                        action,
+                        |view, window, cx| view.submit_editor(window, cx),
+                    ))
                     .child(Self::button(
                         cx,
                         "cancel-editor",
                         "Cancel",
-                        |view, _, cx| {
+                        |view, window, cx| {
                             view.editor = None;
+                            view.focus_active(window, cx);
                             cx.notify();
                         },
                     )),
@@ -1071,41 +1105,92 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn prompt_panel(&self, id: PromptId, prompt: &FormPrompt, cx: &Context<Self>) -> AnyElement {
-        let mut column = div().flex().flex_col().gap_2().max_w(px(560.));
+    fn prompt_panel(
+        &self,
+        tab: &Tab,
+        id: PromptId,
+        prompt: &FormPrompt,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let mut column = div().flex().flex_col().gap_2().w_full().max_w(px(560.));
         match prompt {
             FormPrompt::Host {
                 endpoint,
                 fingerprint,
             } => {
                 column = column
-                    .child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child("Verify SSH host"))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Verify SSH host"),
+                    )
                     .child(endpoint.to_string())
-                    .child(div().font_family("Consolas").text_xs().child(fingerprint.clone()))
-                    .child("Verify this fingerprint with your administrator or another trusted source before approving.")
-                    .child(div().flex().flex_wrap().gap_2()
-                        .child(Self::button(cx, "approve-key", "Approve fingerprint", move |view, window, cx| view.respond(id, Some(true), window, cx)))
-                        .child(Self::button(cx, "deny-key", "Reject", move |view, window, cx| view.respond(id, Some(false), window, cx))));
+                    .child(
+                        div()
+                            .font_family("Consolas")
+                            .text_xs()
+                            .child(fingerprint.clone()),
+                    )
+                    .child(
+                        div().w_full().child(
+                            "Compare this fingerprint with a trusted source before approving.",
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(Self::button(
+                                cx,
+                                "approve-key",
+                                "Approve fingerprint",
+                                move |view, window, cx| view.respond(id, Some(true), window, cx),
+                            ))
+                            .child(Self::button(
+                                cx,
+                                "deny-key",
+                                "Reject",
+                                move |view, window, cx| view.respond(id, Some(false), window, cx),
+                            )),
+                    );
             }
             _ => {
-                column = column.children(prompt.field().cloned()).child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(Self::button(
-                            cx,
-                            "send-credential",
-                            "Continue",
-                            move |view, window, cx| view.respond(id, None, window, cx),
-                        ))
-                        .child(Self::button(
-                            cx,
-                            "cancel-credential",
-                            "Cancel connection",
-                            move |view, _, cx| view.remove(id.attempt.tab, cx),
-                        )),
-                );
+                column = column
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tab.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(tab.endpoint.to_string()),
+                    )
+                    .children(prompt.field().cloned())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(Self::button(
+                                cx,
+                                "send-credential",
+                                "Continue",
+                                move |view, window, cx| view.respond(id, None, window, cx),
+                            ))
+                            .child(Self::button(
+                                cx,
+                                "cancel-credential",
+                                "Cancel connection",
+                                move |view, window, cx| {
+                                    view.remove(id.attempt.tab, cx);
+                                    view.focus_active(window, cx);
+                                },
+                            )),
+                    );
             }
         }
         column.into_any_element()
@@ -1141,14 +1226,18 @@ impl Workspace {
                         cx,
                         "confirm-host-action",
                         action,
-                        |view, _, cx| view.apply_confirmation(cx),
+                        |view, window, cx| {
+                            view.apply_confirmation(cx);
+                            view.focus_active(window, cx);
+                        },
                     ))
                     .child(Self::button(
                         cx,
                         "cancel-host-action",
                         "Cancel",
-                        |view, _, cx| {
+                        |view, window, cx| {
                             view.confirm = None;
+                            view.focus_active(window, cx);
                             cx.notify();
                         },
                     )),
@@ -1169,13 +1258,16 @@ impl Render for Workspace {
         } else if let Some(confirm) = &self.confirm {
             Some((forms[1], self.confirm_panel(confirm, cx)))
         } else {
-            active
-                .and_then(|tab| tab.prompt.as_ref())
-                .map(|(id, prompt)| (forms[2], self.prompt_panel(*id, prompt, cx)))
+            active.and_then(|tab| {
+                tab.prompt
+                    .as_ref()
+                    .map(|(id, prompt)| (forms[2], self.prompt_panel(tab, *id, prompt, cx)))
+            })
         };
         let body = if let Some((id, panel)) = panel {
             div()
                 .id(id)
+                .track_focus(&self.panel_focus)
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
@@ -1258,9 +1350,10 @@ impl Render for Workspace {
                                             cx,
                                             "forget-key",
                                             "Forget host key…",
-                                            move |view, _, cx| {
+                                            move |view, window, cx| {
                                                 view.confirm =
                                                     Some(Confirm::Forget(endpoint.clone()));
+                                                view.focus_active(window, cx);
                                                 cx.notify();
                                             },
                                         ))
@@ -1296,14 +1389,20 @@ impl Render for Workspace {
                                 .min_h_0()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(RULE))
+                                .border_color(rgb(
+                                    if self.terminal.focus_handle(cx).is_focused(window) {
+                                        FOCUS
+                                    } else {
+                                        RULE
+                                    },
+                                ))
                                 .overflow_hidden()
                                 .child(self.terminal.clone()),
                         ),
                 )
                 .into_any_element()
         } else {
-            self.hosts_screen(cx)
+            self.hosts_screen(window, cx)
         };
         div()
             .size_full()
